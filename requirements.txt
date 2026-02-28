@@ -1,0 +1,10 @@
+streamlit
+paddleocr
+paddlepaddle
+opencv-python
+pdf2image
+Pillow
+numpy
+tqdm
+ollama
+python-dotenv
