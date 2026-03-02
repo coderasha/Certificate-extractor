@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -191,7 +192,7 @@ class CertificateExtractor:
 
         parsed = self._parse_model_json(raw_content)
         result = self._normalize_result(parsed)
-        return result.to_dict()
+        return result
 
     def _post_with_fallback(self, payload: dict[str, Any], has_images: bool) -> requests.Response:
         primary_timeout = self.timeout
@@ -280,14 +281,91 @@ class CertificateExtractor:
     @staticmethod
     def _parse_model_json(raw_content: str) -> dict[str, Any]:
         content = raw_content.strip()
+        if not content:
+            raise ValueError("Model did not return valid JSON")
+
+        # Remove markdown fences if present.
+        content = re.sub(r"^```(?:json)?\s*", "", content, flags=re.IGNORECASE)
+        content = re.sub(r"\s*```$", "", content).strip()
+
         try:
             return json.loads(content)
         except json.JSONDecodeError:
-            start = content.find("{")
-            end = content.rfind("}")
-            if start == -1 or end == -1 or end <= start:
-                raise ValueError("Model did not return valid JSON")
-            return json.loads(content[start : end + 1])
+            pass
+
+        # Try best-effort balanced object extraction from mixed text output.
+        candidate = CertificateExtractor._extract_balanced_json_object(content)
+        if candidate:
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                cleaned = re.sub(r",\s*([}\]])", r"\1", candidate)
+                try:
+                    return json.loads(cleaned)
+                except json.JSONDecodeError:
+                    pass
+
+        # Fallback: parse key:value style response into expected schema keys.
+        fallback = CertificateExtractor._parse_key_value_fallback(content)
+        if fallback:
+            return fallback
+
+        raise ValueError("Model did not return valid JSON")
+
+    @staticmethod
+    def _extract_balanced_json_object(text: str) -> str | None:
+        start = text.find("{")
+        if start == -1:
+            return None
+
+        depth = 0
+        in_string = False
+        escape = False
+        for idx, ch in enumerate(text[start:], start=start):
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : idx + 1]
+        return None
+
+    @staticmethod
+    def _parse_key_value_fallback(text: str) -> dict[str, Any]:
+        parsed: dict[str, Any] = {}
+        for line in text.splitlines():
+            line = line.strip().strip(",")
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            key = key.strip().strip('"').strip("'")
+            value = value.strip().strip('"').strip("'")
+            if key:
+                parsed[key] = value if value and value.lower() != "null" else None
+
+        # Keep only entries that look relevant.
+        if not parsed:
+            return {}
+
+        relevant_keys = {k.lower() for k in TARGET_FIELDS}
+        alias_keys = {alias.lower() for aliases in ALIASES.values() for alias in aliases}
+        out: dict[str, Any] = {}
+        for k, v in parsed.items():
+            lk = k.lower()
+            if lk in relevant_keys or lk in alias_keys or lk == "confidence_score":
+                out[k] = v
+        return out
 
     @staticmethod
     def _normalize_result(data: dict[str, Any]) -> dict[str, Any]:
