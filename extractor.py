@@ -188,11 +188,16 @@ class CertificateExtractor:
         body = response.json()
         raw_content = body.get("message", {}).get("content", "")
         if not raw_content:
-            raise ValueError("Model response was empty")
+            return self._rule_based_fallback(text)
 
-        parsed = self._parse_model_json(raw_content)
-        result = self._normalize_result(parsed)
-        return result
+        try:
+            parsed = self._parse_model_json(raw_content)
+            return self._normalize_result(parsed)
+        except ValueError:
+            repaired = self._repair_json_response(raw_content)
+            if repaired is not None:
+                return self._normalize_result(repaired)
+            return self._rule_based_fallback(text)
 
     def _post_with_fallback(self, payload: dict[str, Any], has_images: bool) -> requests.Response:
         primary_timeout = self.timeout
@@ -242,6 +247,43 @@ class CertificateExtractor:
             "Use null if unknown. confidence_score must be float 0..1. No extra text.\n\n"
             f"OCR/Raw Text:\n{text[:2200]}"
         )
+
+    def _repair_json_response(self, raw_content: str) -> dict[str, Any] | None:
+        repair_payload = {
+            "model": self.model,
+            "format": "json",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Convert the user's content to strict valid JSON only.",
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Normalize the following extraction output into valid JSON object with these keys only: "
+                        + ", ".join([*TARGET_FIELDS, "confidence_score"])
+                        + ". Use null for missing fields. Return JSON only.\n\n"
+                        + raw_content[:3500]
+                    ),
+                },
+            ],
+            "stream": False,
+            "keep_alive": "30m",
+            "options": {"temperature": 0, "num_predict": 140},
+        }
+        try:
+            response = requests.post(
+                self.ollama_url,
+                json=repair_payload,
+                timeout=min(max(45, int(self.timeout * 0.6)), 180),
+            )
+            response.raise_for_status()
+            content = response.json().get("message", {}).get("content", "")
+            if not content:
+                return None
+            return self._parse_model_json(content)
+        except Exception:
+            return None
 
     def _prepare_visual_inputs(self, path: Path) -> list[str]:
         suffix = path.suffix.lower()
@@ -365,6 +407,48 @@ class CertificateExtractor:
             lk = k.lower()
             if lk in relevant_keys or lk in alias_keys or lk == "confidence_score":
                 out[k] = v
+        return out
+
+    def _rule_based_fallback(self, text: str) -> dict[str, Any]:
+        normalized_text = " ".join(text.split())
+        out: dict[str, Any] = {field: None for field in TARGET_FIELDS}
+
+        def pick(patterns: list[str]) -> str | None:
+            for pattern in patterns:
+                m = re.search(pattern, normalized_text, flags=re.IGNORECASE)
+                if m:
+                    value = m.group(1).strip(" :,-")
+                    if value:
+                        return value
+            return None
+
+        out["NAME"] = pick([r"(?:NAME|STUDENT NAME)\s*[:\-]\s*([A-Z][A-Z\s\.]{2,})"])
+        out["EXAMINATION"] = pick([r"EXAMINATION\s*[:\-]\s*([A-Z0-9\s\-\(\)\/]{3,})"])
+        out["HELD IN"] = pick([r"HELD IN\s*[:\-]\s*([A-Z0-9\s\/\-]{3,})"])
+        out["SEAT NUMBER"] = pick([r"(?:SEAT NUMBER|ROLL NO|ROLL NUMBER)\s*[:\-]?\s*([A-Z0-9\-\/]{4,})"])
+        out["SPECIALIZATION"] = pick([r"(?:SPECIALIZATION|SPECIALISATION|BRANCH)\s*[:\-]\s*([A-Z0-9\s\-\&]{2,})"])
+        out["AICTE NUMBER"] = pick([r"AICTE(?:\s*NUMBER|\s*NO)?\s*[:\-]?\s*([A-Z0-9\-\/]{4,})"])
+        out["FINAL CGPA"] = pick([r"(?:FINAL\s+CGPA|CGPA)\s*[:\-]?\s*([0-9]+\.[0-9]+|[0-9]+)"])
+        out["Total Credits"] = pick([r"TOTAL CREDITS\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?)"])
+        out["Total Grade Points"] = pick([r"TOTAL GRADE POINTS\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?)"])
+        out["Total Marks Obtained"] = pick([r"TOTAL MARKS(?: OBTAINED)?\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?)"])
+        out["Result Declared On"] = pick(
+            [r"(?:RESULT DECLARED ON|RESULT DATE|DECLARED ON)\s*[:\-]?\s*([0-9]{1,2}[\/\-][0-9]{1,2}[\/\-][0-9]{2,4})"]
+        )
+
+        tri_aliases = {
+            "TRIMESTER I": [r"TRIMESTER\s*I\s*[:\-]?\s*([0-9]+\.[0-9]+|[0-9]+)", r"SEMESTER\s*I\s*[:\-]?\s*([0-9]+\.[0-9]+|[0-9]+)"],
+            "TRIMESTER II": [r"TRIMESTER\s*II\s*[:\-]?\s*([0-9]+\.[0-9]+|[0-9]+)", r"SEMESTER\s*II\s*[:\-]?\s*([0-9]+\.[0-9]+|[0-9]+)"],
+            "TRIMESTER III": [r"TRIMESTER\s*III\s*[:\-]?\s*([0-9]+\.[0-9]+|[0-9]+)", r"SEMESTER\s*III\s*[:\-]?\s*([0-9]+\.[0-9]+|[0-9]+)"],
+            "TRIMESTER IV": [r"TRIMESTER\s*IV\s*[:\-]?\s*([0-9]+\.[0-9]+|[0-9]+)", r"SEMESTER\s*IV\s*[:\-]?\s*([0-9]+\.[0-9]+|[0-9]+)"],
+            "TRIMESTER TRIMESTER I": [r"TRIMESTER\s*V\s*[:\-]?\s*([0-9]+\.[0-9]+|[0-9]+)", r"SEMESTER\s*V\s*[:\-]?\s*([0-9]+\.[0-9]+|[0-9]+)"],
+            "TRIMESTER VI": [r"TRIMESTER\s*VI\s*[:\-]?\s*([0-9]+\.[0-9]+|[0-9]+)", r"SEMESTER\s*VI\s*[:\-]?\s*([0-9]+\.[0-9]+|[0-9]+)"],
+        }
+        for key, patterns in tri_aliases.items():
+            out[key] = pick(patterns)
+
+        filled = sum(1 for field in TARGET_FIELDS if out.get(field))
+        out["confidence_score"] = 0.55 if filled >= 6 else 0.35
         return out
 
     @staticmethod
