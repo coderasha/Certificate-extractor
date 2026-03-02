@@ -8,3 +8,6 @@ numpy
 tqdm
 ollama
 python-dotenv
+pdfplumber
+pytesseract
+requests
