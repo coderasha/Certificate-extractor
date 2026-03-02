@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import json
-import mimetypes
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -41,7 +40,7 @@ class CertificateExtractor:
         model: str = "llama3.2-vision",
         ollama_url: str = "http://localhost:11434/api/chat",
         timeout: int = 120,
-        max_pdf_pages: int = 5,
+        max_pdf_pages: int = 4,
     ) -> None:
         self.model = model
         self.ollama_url = ollama_url
@@ -110,7 +109,7 @@ class CertificateExtractor:
             "- Keep values as strings except confidence_score which must be a float from 0 to 1.\n"
             "- If unavailable, use null for that field.\n"
             "- Do not include extra keys or explanations.\n\n"
-            f"OCR/Raw Text:\n{text[:12000]}"
+            f"OCR/Raw Text:\n{text[:6000]}"
         )
 
         payload = {
@@ -133,9 +132,21 @@ class CertificateExtractor:
 
         try:
             response = requests.post(self.ollama_url, json=payload, timeout=self.timeout)
-            response.raise_for_status()
+        except requests.ReadTimeout:
+            retry_timeout = min(int(self.timeout * 2), 1200)
+            try:
+                response = requests.post(self.ollama_url, json=payload, timeout=retry_timeout)
+            except requests.RequestException as exc:
+                raise RuntimeError(f"Failed to call LLaMA Vision endpoint: {exc}") from exc
         except requests.RequestException as exc:
             raise RuntimeError(f"Failed to call LLaMA Vision endpoint: {exc}") from exc
+
+        if response.status_code >= 400:
+            body_preview = response.text.strip()[:500]
+            raise RuntimeError(
+                "Failed to call LLaMA Vision endpoint: "
+                f"{response.status_code} {response.reason}. Response: {body_preview}"
+            )
 
         body = response.json()
         raw_content = body.get("message", {}).get("content", "")
@@ -149,28 +160,24 @@ class CertificateExtractor:
     def _prepare_visual_inputs(self, path: Path) -> list[str]:
         suffix = path.suffix.lower()
         if suffix == ".pdf":
-            page_images = convert_from_path(str(path), dpi=220, fmt="jpeg")
+            page_images = convert_from_path(str(path), dpi=170, fmt="jpeg")
             encoded_pages: list[str] = []
             for image in page_images[: self.max_pdf_pages]:
-                encoded_pages.append(self._pil_image_to_b64(image, mime_type="image/jpeg"))
+                encoded_pages.append(self._pil_image_to_b64(image))
             return encoded_pages
         return [self._image_b64(path)]
 
     @staticmethod
     def _image_b64(path: Path) -> str:
         data = path.read_bytes()
-        mime_type, _ = mimetypes.guess_type(str(path))
-        encoded = base64.b64encode(data).decode("utf-8")
-        if mime_type:
-            return f"data:{mime_type};base64,{encoded}"
-        return encoded
+        return base64.b64encode(data).decode("utf-8")
 
     @staticmethod
-    def _pil_image_to_b64(image: Image.Image, mime_type: str = "image/jpeg") -> str:
+    def _pil_image_to_b64(image: Image.Image) -> str:
         buffer = BytesIO()
         image.save(buffer, format="JPEG")
         encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
-        return f"data:{mime_type};base64,{encoded}"
+        return encoded
 
     @staticmethod
     def _parse_model_json(raw_content: str) -> dict[str, Any]:
