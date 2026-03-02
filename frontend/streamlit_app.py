@@ -19,7 +19,7 @@ def main() -> None:
         model = st.text_input("Model", value="llama3.2-vision")
         ollama_url = st.text_input("Ollama URL", value="http://localhost:11434/api/chat")
         use_custom_timeout = st.checkbox("Use custom timeout", value=False)
-        timeout = st.number_input("Timeout (seconds)", min_value=30, max_value=1200, value=300)
+        timeout = st.number_input("Timeout (seconds)", min_value=30, max_value=1200, value=150)
 
     uploaded_file = upload_file()
     if not uploaded_file:

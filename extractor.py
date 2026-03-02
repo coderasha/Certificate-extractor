@@ -39,13 +39,13 @@ class CertificateExtractor:
         self,
         model: str = "llama3.2-vision",
         ollama_url: str = "http://localhost:11434/api/chat",
-        timeout: int = 240,
+        timeout: int = 180,
         max_pdf_pages: int = 2,
         ocr_max_pages: int = 2,
-        vision_dpi: int = 140,
-        ocr_dpi: int = 180,
-        max_image_dim: int = 1400,
-        jpeg_quality: int = 70,
+        vision_dpi: int = 130,
+        ocr_dpi: int = 170,
+        max_image_dim: int = 1200,
+        jpeg_quality: int = 62,
     ) -> None:
         self.model = model
         self.ollama_url = ollama_url
@@ -63,17 +63,27 @@ class CertificateExtractor:
             raise FileNotFoundError(f"Input file not found: {file_path}")
 
         text = self.extract_text(path)
+
+        # Stage 1: text-only extraction (typically fastest and enough for many certificates)
+        text_only = self.extract_structured_data(text=text, images=[])
+        if not self._needs_refinement(text_only):
+            return text_only
+
         images = self._prepare_visual_inputs(path)
         if not images:
-            raise ValueError("No visual inputs could be prepared for LLaMA Vision")
+            return text_only
 
-        fast_result = self.extract_structured_data(text=text, images=images[:1])
-        if self._needs_refinement(fast_result) and len(images) > 1:
-            refined_result = self.extract_structured_data(text=text, images=images)
-            if self._result_score(refined_result) >= self._result_score(fast_result):
-                return refined_result
+        # Stage 2: single-image vision extraction
+        one_image = self.extract_structured_data(text=text, images=[images[0]])
+        best = one_image if self._result_score(one_image) >= self._result_score(text_only) else text_only
 
-        return fast_result
+        # Stage 3: multi-image only when still uncertain and extra pages exist
+        if len(images) > 1 and self._needs_refinement(best):
+            multi = self.extract_structured_data(text=text, images=images)
+            if self._result_score(multi) >= self._result_score(best):
+                best = multi
+
+        return best
 
     def extract_text(self, path: Path) -> str:
         suffix = path.suffix.lower()
@@ -94,9 +104,10 @@ class CertificateExtractor:
                     direct_text_chunks.append(txt)
 
         direct_text = "\n\n".join(direct_text_chunks).strip()
-        if len(direct_text) >= 80:
+        if len(direct_text) >= 120:
             return direct_text
 
+        # OCR only on first pages when direct text is weak
         page_count = self._pdf_page_count(path)
         last_page = min(page_count, self.ocr_max_pages)
         if last_page <= 0:
@@ -135,43 +146,23 @@ class CertificateExtractor:
             "messages": [
                 {
                     "role": "system",
-                    "content": "You extract structured fields from certificate documents.",
+                    "content": "Extract certificate fields and return strict JSON only.",
                 },
                 {
                     "role": "user",
                     "content": self._build_prompt(text),
-                    "images": images,
+                    **({"images": images} if images else {}),
                 },
             ],
             "stream": False,
-            "keep_alive": "10m",
+            "keep_alive": "30m",
             "options": {
                 "temperature": 0,
-                "num_predict": 220,
+                "num_predict": 120 if not images else (150 if len(images) == 1 else 200),
             },
         }
 
-        try:
-            response = requests.post(self.ollama_url, json=payload, timeout=self.timeout)
-        except requests.ReadTimeout:
-            fallback_payload = self._build_fallback_payload(text=text, image=images[0])
-            try:
-                response = requests.post(
-                    self.ollama_url,
-                    json=fallback_payload,
-                    timeout=min(int(self.timeout * 1.5), 1200),
-                )
-            except requests.RequestException as exc:
-                raise RuntimeError(f"Failed to call LLaMA Vision endpoint: {exc}") from exc
-        except requests.RequestException as exc:
-            raise RuntimeError(f"Failed to call LLaMA Vision endpoint: {exc}") from exc
-
-        if response.status_code >= 400:
-            body_preview = response.text.strip()[:500]
-            raise RuntimeError(
-                "Failed to call LLaMA Vision endpoint: "
-                f"{response.status_code} {response.reason}. Response: {body_preview}"
-            )
+        response = self._post_with_fallback(payload, has_images=bool(images))
 
         body = response.json()
         raw_content = body.get("message", {}).get("content", "")
@@ -182,36 +173,53 @@ class CertificateExtractor:
         result = self._normalize_result(parsed)
         return result.to_dict()
 
+    def _post_with_fallback(self, payload: dict[str, Any], has_images: bool) -> requests.Response:
+        primary_timeout = self.timeout
+        try:
+            response = requests.post(self.ollama_url, json=payload, timeout=primary_timeout)
+        except requests.ReadTimeout:
+            if has_images:
+                fallback = self._make_lighter_payload(payload)
+                try:
+                    response = requests.post(
+                        self.ollama_url,
+                        json=fallback,
+                        timeout=min(int(primary_timeout * 1.25), 600),
+                    )
+                except requests.RequestException as exc:
+                    raise RuntimeError(f"Failed to call LLaMA Vision endpoint: {exc}") from exc
+            else:
+                raise RuntimeError(
+                    f"Failed to call LLaMA Vision endpoint: Read timed out. (read timeout={primary_timeout})"
+                )
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Failed to call LLaMA Vision endpoint: {exc}") from exc
+
+        if response.status_code >= 400:
+            body_preview = response.text.strip()[:500]
+            raise RuntimeError(
+                "Failed to call LLaMA Vision endpoint: "
+                f"{response.status_code} {response.reason}. Response: {body_preview}"
+            )
+        return response
+
+    @staticmethod
+    def _make_lighter_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        lighter = json.loads(json.dumps(payload))
+        user_msg = lighter["messages"][1]
+        images = user_msg.get("images", [])
+        if images:
+            user_msg["images"] = images[:1]
+        lighter["options"]["num_predict"] = 110
+        return lighter
+
     def _build_prompt(self, text: str) -> str:
         return (
-            "Extract certificate information and return STRICT JSON only with keys: "
+            "Extract certificate info and output STRICT JSON with keys: "
             "student_name, course_name, issue_date, certificate_id, issuer, confidence_score.\n"
-            "Rules:\n"
-            "- Keep values as strings except confidence_score as float 0..1.\n"
-            "- If unavailable, use null.\n"
-            "- No extra keys or explanation.\n\n"
-            f"OCR/Raw Text:\n{text[:3500]}"
+            "Use null if unknown. confidence_score must be float 0..1. No extra text.\n\n"
+            f"OCR/Raw Text:\n{text[:2200]}"
         )
-
-    def _build_fallback_payload(self, text: str, image: str) -> dict[str, Any]:
-        return {
-            "model": self.model,
-            "format": "json",
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "Return only JSON for certificate extraction.",
-                },
-                {
-                    "role": "user",
-                    "content": self._build_prompt(text[:2000]),
-                    "images": [image],
-                },
-            ],
-            "stream": False,
-            "keep_alive": "10m",
-            "options": {"temperature": 0, "num_predict": 160},
-        }
 
     def _prepare_visual_inputs(self, path: Path) -> list[str]:
         suffix = path.suffix.lower()
