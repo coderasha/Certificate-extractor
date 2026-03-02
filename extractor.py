@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import json
-from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -14,24 +13,45 @@ from pdf2image import convert_from_path
 from PIL import Image
 
 
-@dataclass
-class ExtractionResult:
-    student_name: str | None
-    course_name: str | None
-    issue_date: str | None
-    certificate_id: str | None
-    issuer: str | None
-    confidence_score: float
+TARGET_FIELDS = [
+    "NAME",
+    "EXAMINATION",
+    "HELD IN",
+    "SEAT NUMBER",
+    "SPECIALIZATION",
+    "AICTE NUMBER",
+    "TRIMESTER I",
+    "TRIMESTER II",
+    "TRIMESTER III",
+    "TRIMESTER IV",
+    "TRIMESTER TRIMESTER I",
+    "TRIMESTER VI",
+    "FINAL CGPA",
+    "Total Credits",
+    "Total Grade Points",
+    "Total Marks Obtained",
+    "Result Declared On",
+]
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "student_name": self.student_name,
-            "course_name": self.course_name,
-            "issue_date": self.issue_date,
-            "certificate_id": self.certificate_id,
-            "issuer": self.issuer,
-            "confidence_score": self.confidence_score,
-        }
+ALIASES = {
+    "NAME": ["STUDENT NAME", "CANDIDATE NAME"],
+    "EXAMINATION": ["EXAM", "PROGRAMME", "COURSE"],
+    "HELD IN": ["HELD_IN", "MONTH/YEAR", "SESSION"],
+    "SEAT NUMBER": ["SEAT_NO", "SEAT NO", "ROLL NUMBER", "ROLL NO"],
+    "SPECIALIZATION": ["SPECIALISATION", "BRANCH", "STREAM"],
+    "AICTE NUMBER": ["AICTE NO", "AICTE", "AICTE_NUMBER"],
+    "TRIMESTER I": ["TRIMESTER 1", "SEMESTER I", "SEMESTER 1"],
+    "TRIMESTER II": ["TRIMESTER 2", "SEMESTER II", "SEMESTER 2"],
+    "TRIMESTER III": ["TRIMESTER 3", "SEMESTER III", "SEMESTER 3"],
+    "TRIMESTER IV": ["TRIMESTER 4", "SEMESTER IV", "SEMESTER 4"],
+    "TRIMESTER TRIMESTER I": ["TRIMESTER V", "SEMESTER V", "SEMESTER 5", "TRIMESTER 5"],
+    "TRIMESTER VI": ["TRIMESTER 6", "SEMESTER VI", "SEMESTER 6"],
+    "FINAL CGPA": ["CGPA", "FINAL_GPA"],
+    "Total Credits": ["TOTAL CREDITS", "TOTAL_CREDITS"],
+    "Total Grade Points": ["TOTAL GRADE POINTS", "TOTAL_GRADE_POINTS"],
+    "Total Marks Obtained": ["TOTAL MARKS", "TOTAL MARKS OBTAINED", "TOTAL_MARKS_OBTAINED"],
+    "Result Declared On": ["RESULT DATE", "DECLARED ON", "RESULT_DECLARED_ON"],
+}
 
 
 class CertificateExtractor:
@@ -214,9 +234,10 @@ class CertificateExtractor:
         return lighter
 
     def _build_prompt(self, text: str) -> str:
+        keys = ", ".join([*TARGET_FIELDS, "confidence_score"])
         return (
-            "Extract certificate info and output STRICT JSON with keys: "
-            "student_name, course_name, issue_date, certificate_id, issuer, confidence_score.\n"
+            "Extract marksheet/certificate info and output STRICT JSON with keys: "
+            f"{keys}.\n"
             "Use null if unknown. confidence_score must be float 0..1. No extra text.\n\n"
             f"OCR/Raw Text:\n{text[:2200]}"
         )
@@ -269,12 +290,27 @@ class CertificateExtractor:
             return json.loads(content[start : end + 1])
 
     @staticmethod
-    def _normalize_result(data: dict[str, Any]) -> ExtractionResult:
+    def _normalize_result(data: dict[str, Any]) -> dict[str, Any]:
         def as_text(value: Any) -> str | None:
             if value is None:
                 return None
             text = str(value).strip()
             return text or None
+
+        flattened = {str(k).strip(): v for k, v in data.items()}
+
+        def get_value(key: str) -> str | None:
+            direct = as_text(flattened.get(key))
+            if direct is not None:
+                return direct
+
+            lookup = {k.lower(): v for k, v in flattened.items()}
+            alias_candidates = [key, *ALIASES.get(key, [])]
+            for alias in alias_candidates:
+                candidate = as_text(lookup.get(alias.lower()))
+                if candidate is not None:
+                    return candidate
+            return None
 
         raw_conf = data.get("confidence_score", 0.0)
         try:
@@ -283,25 +319,20 @@ class CertificateExtractor:
             confidence = 0.0
         confidence = max(0.0, min(1.0, confidence))
 
-        return ExtractionResult(
-            student_name=as_text(data.get("student_name")),
-            course_name=as_text(data.get("course_name")),
-            issue_date=as_text(data.get("issue_date")),
-            certificate_id=as_text(data.get("certificate_id")),
-            issuer=as_text(data.get("issuer")),
-            confidence_score=confidence,
-        )
+        normalized: dict[str, Any] = {field: get_value(field) for field in TARGET_FIELDS}
+        normalized["confidence_score"] = confidence
+        return normalized
 
     @staticmethod
     def _result_score(result: dict[str, Any]) -> float:
-        fields = ["student_name", "course_name", "issue_date", "certificate_id", "issuer"]
+        fields = TARGET_FIELDS
         filled = sum(1 for field in fields if result.get(field))
         conf = float(result.get("confidence_score", 0.0) or 0.0)
-        return float(filled) + conf
+        return float(filled) + (conf * 2.0)
 
     @staticmethod
     def _needs_refinement(result: dict[str, Any]) -> bool:
-        fields = ["student_name", "course_name", "issue_date", "certificate_id", "issuer"]
+        fields = TARGET_FIELDS
         filled = sum(1 for field in fields if result.get(field))
         conf = float(result.get("confidence_score", 0.0) or 0.0)
-        return filled < 3 or conf < 0.7
+        return filled < 8 or conf < 0.75
