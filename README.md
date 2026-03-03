@@ -8,6 +8,13 @@ Upload a certificate (PDF/image) and send it directly to LLaMA Vision 3.2 to get
 - `issue_date`
 - `certificate_id`
 - `issuer`
+- `institute_details`
+- `student_details`
+- `course_details`
+- `result_summary`
+- `trimester_wise_performance`
+- `final_summary`
+- `result_declaration`
 - `confidence_score`
 
 ## Setup

@@ -20,9 +20,47 @@ TARGET_FIELDS = [
     "issuer",
 ]
 
+DETAILED_SECTION_DEFAULTS = {
+    "institute_details": {
+        "name": None,
+        "address": None,
+        "approval": None,
+        "document_type": None,
+    },
+    "student_details": {
+        "name": None,
+        "examination": None,
+        "held_in": None,
+        "specialization": None,
+        "seat_number": None,
+        "aicte_number": None,
+    },
+    "course_details": [],
+    "result_summary": {
+        "total_marks_obtained": None,
+        "total_maximum_marks": None,
+        "percentage": None,
+        "gpa": None,
+        "overall_grade": None,
+        "grade_range": None,
+        "result": None,
+    },
+    "trimester_wise_performance": [],
+    "final_summary": {
+        "final_cgpa": None,
+        "total_credits": None,
+        "total_grade_points": None,
+        "total_marks_obtained": None,
+        "total_maximum_marks": None,
+    },
+    "result_declaration": {
+        "result_declared_on": None,
+        "signed_by": None,
+    },
+}
+
 ALIASES = {
     "student_name": [
-        "name",
         "student name",
         "candidate name",
         "learner_name",
@@ -176,11 +214,13 @@ class CertificateExtractor:
         return lighter
 
     def _build_prompt(self) -> str:
-        keys = ", ".join([*TARGET_FIELDS, "confidence_score"])
+        keys = ", ".join([*TARGET_FIELDS, *DETAILED_SECTION_DEFAULTS.keys(), "confidence_score"])
         return (
             "Extract certificate details from the attached image(s) and output STRICT JSON with keys: "
             f"{keys}.\n"
-            "Use null if unknown. confidence_score must be float 0..1. No extra text."
+            "Use null for unknown values and empty arrays when list sections are unavailable.\n"
+            "For list sections, include all visible entries from the certificate.\n"
+            "confidence_score must be float 0..1. No extra text."
         )
 
     def _repair_json_response(self, raw_content: str) -> dict[str, Any] | None:
@@ -196,7 +236,7 @@ class CertificateExtractor:
                     "role": "user",
                     "content": (
                         "Normalize the following extraction output into valid JSON object with these keys only: "
-                        + ", ".join([*TARGET_FIELDS, "confidence_score"])
+                        + ", ".join([*TARGET_FIELDS, *DETAILED_SECTION_DEFAULTS.keys(), "confidence_score"])
                         + ". Use null for missing fields. Return JSON only.\n\n"
                         + raw_content[:3500]
                     ),
@@ -353,13 +393,13 @@ class CertificateExtractor:
             return text or None
 
         flattened = {str(k).strip(): v for k, v in data.items()}
+        lookup = CertificateExtractor._build_lookup(data)
 
         def get_value(key: str) -> str | None:
             direct = as_text(flattened.get(key))
             if direct is not None:
                 return direct
 
-            lookup = {k.lower(): v for k, v in flattened.items()}
             alias_candidates = [key, *ALIASES.get(key, [])]
             for alias in alias_candidates:
                 candidate = as_text(lookup.get(alias.lower()))
@@ -368,6 +408,55 @@ class CertificateExtractor:
             return None
 
         normalized: dict[str, Any] = {field: get_value(field) for field in TARGET_FIELDS}
+        normalized["institute_details"] = CertificateExtractor._normalize_section_dict(
+            data.get("institute_details"),
+            DETAILED_SECTION_DEFAULTS["institute_details"],
+        )
+        normalized["student_details"] = CertificateExtractor._normalize_section_dict(
+            data.get("student_details"),
+            DETAILED_SECTION_DEFAULTS["student_details"],
+        )
+        normalized["course_details"] = CertificateExtractor._normalize_list_of_dicts(data.get("course_details"))
+        normalized["result_summary"] = CertificateExtractor._normalize_section_dict(
+            data.get("result_summary"),
+            DETAILED_SECTION_DEFAULTS["result_summary"],
+        )
+        normalized["trimester_wise_performance"] = CertificateExtractor._normalize_list_of_dicts(
+            data.get("trimester_wise_performance")
+        )
+        normalized["final_summary"] = CertificateExtractor._normalize_section_dict(
+            data.get("final_summary"),
+            DETAILED_SECTION_DEFAULTS["final_summary"],
+        )
+        normalized["result_declaration"] = CertificateExtractor._normalize_section_dict(
+            data.get("result_declaration"),
+            DETAILED_SECTION_DEFAULTS["result_declaration"],
+        )
+
+        # Fill key detailed fields from top-level aliases when nested section is absent/empty.
+        if not normalized["student_details"].get("name"):
+            normalized["student_details"]["name"] = normalized["student_name"]
+        if not normalized["student_details"].get("examination"):
+            normalized["student_details"]["examination"] = normalized["course_name"]
+        if not normalized["student_details"].get("seat_number"):
+            normalized["student_details"]["seat_number"] = normalized["certificate_id"]
+        if not normalized["result_declaration"].get("result_declared_on"):
+            normalized["result_declaration"]["result_declared_on"] = normalized["issue_date"]
+        if not normalized["institute_details"].get("name"):
+            normalized["institute_details"]["name"] = normalized["issuer"]
+
+        # Fill top-level fields from nested sections when available.
+        if not normalized["student_name"]:
+            normalized["student_name"] = normalized["student_details"].get("name")
+        if not normalized["course_name"]:
+            normalized["course_name"] = normalized["student_details"].get("examination")
+        if not normalized["certificate_id"]:
+            normalized["certificate_id"] = normalized["student_details"].get("seat_number")
+        if not normalized["issue_date"]:
+            normalized["issue_date"] = normalized["result_declaration"].get("result_declared_on")
+        if not normalized["issuer"]:
+            normalized["issuer"] = normalized["institute_details"].get("name")
+
         raw_conf = data.get("confidence_score", None)
         if raw_conf is not None:
             try:
@@ -380,3 +469,58 @@ class CertificateExtractor:
         confidence = max(0.0, min(1.0, confidence))
         normalized["confidence_score"] = confidence
         return normalized
+
+    @staticmethod
+    def _build_lookup(data: Any) -> dict[str, Any]:
+        lookup: dict[str, Any] = {}
+
+        def walk(node: Any) -> None:
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    key_name = str(key).strip().lower()
+                    if not isinstance(value, (dict, list)):
+                        if key_name not in lookup:
+                            lookup[key_name] = value
+                    walk(value)
+            elif isinstance(node, list):
+                for item in node:
+                    walk(item)
+
+        walk(data if isinstance(data, dict) else {})
+        return lookup
+
+    @staticmethod
+    def _normalize_section_dict(value: Any, defaults: dict[str, Any]) -> dict[str, Any]:
+        out = dict(defaults)
+        if not isinstance(value, dict):
+            return out
+        for key in defaults.keys():
+            raw = value.get(key, None)
+            if raw is None:
+                out[key] = None
+            elif isinstance(raw, str):
+                text = raw.strip()
+                out[key] = text or None
+            else:
+                out[key] = raw
+        return out
+
+    @staticmethod
+    def _normalize_list_of_dicts(value: Any) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        out: list[dict[str, Any]] = []
+        for item in value:
+            if isinstance(item, dict):
+                normalized_item: dict[str, Any] = {}
+                for key, raw in item.items():
+                    if raw is None:
+                        normalized_item[str(key)] = None
+                    elif isinstance(raw, str):
+                        text = raw.strip()
+                        normalized_item[str(key)] = text or None
+                    else:
+                        normalized_item[str(key)] = raw
+                if normalized_item:
+                    out.append(normalized_item)
+        return out
