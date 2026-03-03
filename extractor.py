@@ -7,10 +7,8 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 
-import pdfplumber
-import pytesseract
 import requests
-from pdf2image import convert_from_path
+from pdf2image import convert_from_path, pdfinfo_from_path
 from PIL import Image
 
 
@@ -62,9 +60,7 @@ class CertificateExtractor:
         ollama_url: str = "http://localhost:11434/api/chat",
         timeout: int = 180,
         max_pdf_pages: int = 2,
-        ocr_max_pages: int = 2,
         vision_dpi: int = 130,
-        ocr_dpi: int = 170,
         max_image_dim: int = 1200,
         jpeg_quality: int = 62,
     ) -> None:
@@ -72,9 +68,7 @@ class CertificateExtractor:
         self.ollama_url = ollama_url
         self.timeout = timeout
         self.max_pdf_pages = max_pdf_pages
-        self.ocr_max_pages = ocr_max_pages
         self.vision_dpi = vision_dpi
-        self.ocr_dpi = ocr_dpi
         self.max_image_dim = max_image_dim
         self.jpeg_quality = jpeg_quality
 
@@ -83,112 +77,41 @@ class CertificateExtractor:
         if not path.exists() or not path.is_file():
             raise FileNotFoundError(f"Input file not found: {file_path}")
 
-        text = self.extract_text(path)
-
-        # Stage 1: text-only extraction (typically fastest and enough for many certificates)
-        text_only = self.extract_structured_data(text=text, images=[])
-        if not self._needs_refinement(text_only):
-            return text_only
-
         images = self._prepare_visual_inputs(path)
         if not images:
-            return text_only
+            raise ValueError("Unable to prepare visual inputs from file")
 
-        # Stage 2: single-image vision extraction
-        one_image = self.extract_structured_data(text=text, images=[images[0]])
-        best = one_image if self._result_score(one_image) >= self._result_score(text_only) else text_only
+        return self.extract_structured_data(images)
 
-        # Stage 3: multi-image only when still uncertain and extra pages exist
-        if len(images) > 1 and self._needs_refinement(best):
-            multi = self.extract_structured_data(text=text, images=images)
-            if self._result_score(multi) >= self._result_score(best):
-                best = multi
-
-        return best
-
-    def extract_text(self, path: Path) -> str:
-        suffix = path.suffix.lower()
-        if suffix == ".pdf":
-            return self._extract_text_from_pdf(path)
-        if suffix in {".png", ".jpg", ".jpeg", ".webp", ".tiff", ".bmp"}:
-            return self._extract_text_from_image(path)
-        raise ValueError(
-            "Unsupported file type. Supported types: PDF, PNG, JPG, JPEG, WEBP, TIFF, BMP"
-        )
-
-    def _extract_text_from_pdf(self, path: Path) -> str:
-        direct_text_chunks: list[str] = []
-        with pdfplumber.open(path) as pdf:
-            for page in pdf.pages:
-                txt = (page.extract_text() or "").strip()
-                if txt:
-                    direct_text_chunks.append(txt)
-
-        direct_text = "\n\n".join(direct_text_chunks).strip()
-        if len(direct_text) >= 120:
-            return direct_text
-
-        # OCR only on first pages when direct text is weak
-        page_count = self._pdf_page_count(path)
-        last_page = min(page_count, self.ocr_max_pages)
-        if last_page <= 0:
-            raise ValueError("PDF has no pages")
-
-        ocr_chunks: list[str] = []
-        page_images = convert_from_path(
-            str(path),
-            dpi=self.ocr_dpi,
-            fmt="jpeg",
-            first_page=1,
-            last_page=last_page,
-            thread_count=2,
-        )
-        for image in page_images:
-            ocr_text = pytesseract.image_to_string(image).strip()
-            if ocr_text:
-                ocr_chunks.append(ocr_text)
-
-        merged = "\n\n".join([direct_text, *ocr_chunks]).strip()
-        if not merged:
-            raise ValueError("No text could be extracted from the PDF")
-        return merged
-
-    def _extract_text_from_image(self, path: Path) -> str:
-        with Image.open(path) as image:
-            text = pytesseract.image_to_string(image).strip()
-        if not text:
-            raise ValueError("No text could be extracted from the image")
-        return text
-
-    def extract_structured_data(self, text: str, images: list[str]) -> dict[str, Any]:
+    def extract_structured_data(self, images: list[str]) -> dict[str, Any]:
         payload = {
             "model": self.model,
             "format": "json",
             "messages": [
                 {
                     "role": "system",
-                    "content": "Extract certificate fields and return strict JSON only.",
+                    "content": "You extract certificate data. Return strict JSON only.",
                 },
                 {
                     "role": "user",
-                    "content": self._build_prompt(text),
-                    **({"images": images} if images else {}),
+                    "content": self._build_prompt(),
+                    "images": images,
                 },
             ],
             "stream": False,
             "keep_alive": "30m",
             "options": {
                 "temperature": 0,
-                "num_predict": 120 if not images else (150 if len(images) == 1 else 200),
+                "num_predict": 180 if len(images) == 1 else 240,
             },
         }
 
-        response = self._post_with_fallback(payload, has_images=bool(images))
-
+        response = self._post_with_fallback(payload)
         body = response.json()
         raw_content = body.get("message", {}).get("content", "")
+
         if not raw_content:
-            return self._rule_based_fallback(text)
+            return self._normalize_result({})
 
         try:
             parsed = self._parse_model_json(raw_content)
@@ -197,27 +120,21 @@ class CertificateExtractor:
             repaired = self._repair_json_response(raw_content)
             if repaired is not None:
                 return self._normalize_result(repaired)
-            return self._rule_based_fallback(text)
+            return self._normalize_result({})
 
-    def _post_with_fallback(self, payload: dict[str, Any], has_images: bool) -> requests.Response:
-        primary_timeout = self.timeout
+    def _post_with_fallback(self, payload: dict[str, Any]) -> requests.Response:
         try:
-            response = requests.post(self.ollama_url, json=payload, timeout=primary_timeout)
+            response = requests.post(self.ollama_url, json=payload, timeout=self.timeout)
         except requests.ReadTimeout:
-            if has_images:
-                fallback = self._make_lighter_payload(payload)
-                try:
-                    response = requests.post(
-                        self.ollama_url,
-                        json=fallback,
-                        timeout=min(int(primary_timeout * 1.25), 600),
-                    )
-                except requests.RequestException as exc:
-                    raise RuntimeError(f"Failed to call LLaMA Vision endpoint: {exc}") from exc
-            else:
-                raise RuntimeError(
-                    f"Failed to call LLaMA Vision endpoint: Read timed out. (read timeout={primary_timeout})"
+            fallback = self._make_lighter_payload(payload)
+            try:
+                response = requests.post(
+                    self.ollama_url,
+                    json=fallback,
+                    timeout=min(int(self.timeout * 1.25), 600),
                 )
+            except requests.RequestException as exc:
+                raise RuntimeError(f"Failed to call LLaMA Vision endpoint: {exc}") from exc
         except requests.RequestException as exc:
             raise RuntimeError(f"Failed to call LLaMA Vision endpoint: {exc}") from exc
 
@@ -236,16 +153,15 @@ class CertificateExtractor:
         images = user_msg.get("images", [])
         if images:
             user_msg["images"] = images[:1]
-        lighter["options"]["num_predict"] = 110
+        lighter["options"]["num_predict"] = 140
         return lighter
 
-    def _build_prompt(self, text: str) -> str:
+    def _build_prompt(self) -> str:
         keys = ", ".join([*TARGET_FIELDS, "confidence_score"])
         return (
-            "Extract marksheet/certificate info and output STRICT JSON with keys: "
+            "Extract marksheet/certificate info from the attached image(s) and output STRICT JSON with keys: "
             f"{keys}.\n"
-            "Use null if unknown. confidence_score must be float 0..1. No extra text.\n\n"
-            f"OCR/Raw Text:\n{text[:2200]}"
+            "Use null if unknown. confidence_score must be float 0..1. No extra text."
         )
 
     def _repair_json_response(self, raw_content: str) -> dict[str, Any] | None:
@@ -303,13 +219,18 @@ class CertificateExtractor:
             )
             return [self._pil_image_to_b64(image) for image in page_images]
 
+        if suffix not in {".png", ".jpg", ".jpeg", ".webp", ".tiff", ".bmp"}:
+            raise ValueError(
+                "Unsupported file type. Supported types: PDF, PNG, JPG, JPEG, WEBP, TIFF, BMP"
+            )
+
         with Image.open(path) as image:
             return [self._pil_image_to_b64(image)]
 
     @staticmethod
     def _pdf_page_count(path: Path) -> int:
-        with pdfplumber.open(path) as pdf:
-            return len(pdf.pages)
+        info = pdfinfo_from_path(str(path))
+        return int(info.get("Pages", 0))
 
     def _pil_image_to_b64(self, image: Image.Image) -> str:
         image = image.convert("RGB")
@@ -317,8 +238,7 @@ class CertificateExtractor:
 
         buffer = BytesIO()
         image.save(buffer, format="JPEG", quality=self.jpeg_quality, optimize=True)
-        encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
-        return encoded
+        return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
     @staticmethod
     def _parse_model_json(raw_content: str) -> dict[str, Any]:
@@ -326,7 +246,6 @@ class CertificateExtractor:
         if not content:
             raise ValueError("Model did not return valid JSON")
 
-        # Remove markdown fences if present.
         content = re.sub(r"^```(?:json)?\s*", "", content, flags=re.IGNORECASE)
         content = re.sub(r"\s*```$", "", content).strip()
 
@@ -335,7 +254,6 @@ class CertificateExtractor:
         except json.JSONDecodeError:
             pass
 
-        # Try best-effort balanced object extraction from mixed text output.
         candidate = CertificateExtractor._extract_balanced_json_object(content)
         if candidate:
             try:
@@ -347,7 +265,6 @@ class CertificateExtractor:
                 except json.JSONDecodeError:
                     pass
 
-        # Fallback: parse key:value style response into expected schema keys.
         fallback = CertificateExtractor._parse_key_value_fallback(content)
         if fallback:
             return fallback
@@ -396,59 +313,16 @@ class CertificateExtractor:
             if key:
                 parsed[key] = value if value and value.lower() != "null" else None
 
-        # Keep only entries that look relevant.
         if not parsed:
             return {}
 
         relevant_keys = {k.lower() for k in TARGET_FIELDS}
         alias_keys = {alias.lower() for aliases in ALIASES.values() for alias in aliases}
         out: dict[str, Any] = {}
-        for k, v in parsed.items():
-            lk = k.lower()
-            if lk in relevant_keys or lk in alias_keys or lk == "confidence_score":
-                out[k] = v
-        return out
-
-    def _rule_based_fallback(self, text: str) -> dict[str, Any]:
-        normalized_text = " ".join(text.split())
-        out: dict[str, Any] = {field: None for field in TARGET_FIELDS}
-
-        def pick(patterns: list[str]) -> str | None:
-            for pattern in patterns:
-                m = re.search(pattern, normalized_text, flags=re.IGNORECASE)
-                if m:
-                    value = m.group(1).strip(" :,-")
-                    if value:
-                        return value
-            return None
-
-        out["NAME"] = pick([r"(?:NAME|STUDENT NAME)\s*[:\-]\s*([A-Z][A-Z\s\.]{2,})"])
-        out["EXAMINATION"] = pick([r"EXAMINATION\s*[:\-]\s*([A-Z0-9\s\-\(\)\/]{3,})"])
-        out["HELD IN"] = pick([r"HELD IN\s*[:\-]\s*([A-Z0-9\s\/\-]{3,})"])
-        out["SEAT NUMBER"] = pick([r"(?:SEAT NUMBER|ROLL NO|ROLL NUMBER)\s*[:\-]?\s*([A-Z0-9\-\/]{4,})"])
-        out["SPECIALIZATION"] = pick([r"(?:SPECIALIZATION|SPECIALISATION|BRANCH)\s*[:\-]\s*([A-Z0-9\s\-\&]{2,})"])
-        out["AICTE NUMBER"] = pick([r"AICTE(?:\s*NUMBER|\s*NO)?\s*[:\-]?\s*([A-Z0-9\-\/]{4,})"])
-        out["FINAL CGPA"] = pick([r"(?:FINAL\s+CGPA|CGPA)\s*[:\-]?\s*([0-9]+\.[0-9]+|[0-9]+)"])
-        out["Total Credits"] = pick([r"TOTAL CREDITS\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?)"])
-        out["Total Grade Points"] = pick([r"TOTAL GRADE POINTS\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?)"])
-        out["Total Marks Obtained"] = pick([r"TOTAL MARKS(?: OBTAINED)?\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?)"])
-        out["Result Declared On"] = pick(
-            [r"(?:RESULT DECLARED ON|RESULT DATE|DECLARED ON)\s*[:\-]?\s*([0-9]{1,2}[\/\-][0-9]{1,2}[\/\-][0-9]{2,4})"]
-        )
-
-        tri_aliases = {
-            "TRIMESTER I": [r"TRIMESTER\s*I\s*[:\-]?\s*([0-9]+\.[0-9]+|[0-9]+)", r"SEMESTER\s*I\s*[:\-]?\s*([0-9]+\.[0-9]+|[0-9]+)"],
-            "TRIMESTER II": [r"TRIMESTER\s*II\s*[:\-]?\s*([0-9]+\.[0-9]+|[0-9]+)", r"SEMESTER\s*II\s*[:\-]?\s*([0-9]+\.[0-9]+|[0-9]+)"],
-            "TRIMESTER III": [r"TRIMESTER\s*III\s*[:\-]?\s*([0-9]+\.[0-9]+|[0-9]+)", r"SEMESTER\s*III\s*[:\-]?\s*([0-9]+\.[0-9]+|[0-9]+)"],
-            "TRIMESTER IV": [r"TRIMESTER\s*IV\s*[:\-]?\s*([0-9]+\.[0-9]+|[0-9]+)", r"SEMESTER\s*IV\s*[:\-]?\s*([0-9]+\.[0-9]+|[0-9]+)"],
-            "TRIMESTER TRIMESTER I": [r"TRIMESTER\s*V\s*[:\-]?\s*([0-9]+\.[0-9]+|[0-9]+)", r"SEMESTER\s*V\s*[:\-]?\s*([0-9]+\.[0-9]+|[0-9]+)"],
-            "TRIMESTER VI": [r"TRIMESTER\s*VI\s*[:\-]?\s*([0-9]+\.[0-9]+|[0-9]+)", r"SEMESTER\s*VI\s*[:\-]?\s*([0-9]+\.[0-9]+|[0-9]+)"],
-        }
-        for key, patterns in tri_aliases.items():
-            out[key] = pick(patterns)
-
-        filled = sum(1 for field in TARGET_FIELDS if out.get(field))
-        out["confidence_score"] = 0.55 if filled >= 6 else 0.35
+        for key, value in parsed.items():
+            lower_key = key.lower()
+            if lower_key in relevant_keys or lower_key in alias_keys or lower_key == "confidence_score":
+                out[key] = value
         return out
 
     @staticmethod
@@ -484,17 +358,3 @@ class CertificateExtractor:
         normalized: dict[str, Any] = {field: get_value(field) for field in TARGET_FIELDS}
         normalized["confidence_score"] = confidence
         return normalized
-
-    @staticmethod
-    def _result_score(result: dict[str, Any]) -> float:
-        fields = TARGET_FIELDS
-        filled = sum(1 for field in fields if result.get(field))
-        conf = float(result.get("confidence_score", 0.0) or 0.0)
-        return float(filled) + (conf * 2.0)
-
-    @staticmethod
-    def _needs_refinement(result: dict[str, Any]) -> bool:
-        fields = TARGET_FIELDS
-        filled = sum(1 for field in fields if result.get(field))
-        conf = float(result.get("confidence_score", 0.0) or 0.0)
-        return filled < 8 or conf < 0.75

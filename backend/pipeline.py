@@ -17,9 +17,7 @@ def run_pipeline(
         ollama_url=ollama_url,
         timeout=timeout,
         max_pdf_pages=config["max_pdf_pages"],
-        ocr_max_pages=config["ocr_max_pages"],
         vision_dpi=config["vision_dpi"],
-        ocr_dpi=config["ocr_dpi"],
         max_image_dim=config["max_image_dim"],
         jpeg_quality=config["jpeg_quality"],
     )

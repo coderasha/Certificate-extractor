@@ -1,6 +1,6 @@
 # Certificate Extractor
 
-Upload a certificate (PDF/image), extract text (direct PDF + OCR), and get structured JSON via LLaMA Vision 3.2.
+Upload a certificate (PDF/image) and send it directly to LLaMA Vision 3.2 to get structured JSON.
 
 ## Output JSON Fields
 - `student_name`
@@ -15,7 +15,6 @@ Upload a certificate (PDF/image), extract text (direct PDF + OCR), and get struc
 2. Install Python dependencies:
    `pip install -r requirements.txt`
 3. Install system dependencies:
-   - `tesseract` (required by `pytesseract`)
    - Poppler (`pdftoppm`) required by `pdf2image`
 4. Start Ollama with a vision model available, for example:
    - `ollama pull llama3.2-vision`

@@ -12,7 +12,7 @@ from backend.pipeline import run_pipeline
 def main() -> None:
     st.set_page_config(page_title="Certificate Extractor", layout="wide")
     st.title("Certificate Extractor")
-    st.caption("Upload a certificate (PDF/image) and extract structured fields with LLaMA Vision 3.2.")
+    st.caption("Upload a certificate (PDF/image) and send it directly to LLaMA Vision 3.2 for JSON extraction.")
 
     with st.sidebar:
         st.subheader("Model Settings")
