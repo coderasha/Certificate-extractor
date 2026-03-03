@@ -13,43 +13,62 @@ from PIL import Image
 
 
 TARGET_FIELDS = [
-    "NAME",
-    "EXAMINATION",
-    "HELD IN",
-    "SEAT NUMBER",
-    "SPECIALIZATION",
-    "AICTE NUMBER",
-    "TRIMESTER I",
-    "TRIMESTER II",
-    "TRIMESTER III",
-    "TRIMESTER IV",
-    "TRIMESTER TRIMESTER I",
-    "TRIMESTER VI",
-    "FINAL CGPA",
-    "Total Credits",
-    "Total Grade Points",
-    "Total Marks Obtained",
-    "Result Declared On",
+    "student_name",
+    "course_name",
+    "issue_date",
+    "certificate_id",
+    "issuer",
 ]
 
 ALIASES = {
-    "NAME": ["STUDENT NAME", "CANDIDATE NAME"],
-    "EXAMINATION": ["EXAM", "PROGRAMME", "COURSE"],
-    "HELD IN": ["HELD_IN", "MONTH/YEAR", "SESSION"],
-    "SEAT NUMBER": ["SEAT_NO", "SEAT NO", "ROLL NUMBER", "ROLL NO"],
-    "SPECIALIZATION": ["SPECIALISATION", "BRANCH", "STREAM"],
-    "AICTE NUMBER": ["AICTE NO", "AICTE", "AICTE_NUMBER"],
-    "TRIMESTER I": ["TRIMESTER 1", "SEMESTER I", "SEMESTER 1"],
-    "TRIMESTER II": ["TRIMESTER 2", "SEMESTER II", "SEMESTER 2"],
-    "TRIMESTER III": ["TRIMESTER 3", "SEMESTER III", "SEMESTER 3"],
-    "TRIMESTER IV": ["TRIMESTER 4", "SEMESTER IV", "SEMESTER 4"],
-    "TRIMESTER TRIMESTER I": ["TRIMESTER V", "SEMESTER V", "SEMESTER 5", "TRIMESTER 5"],
-    "TRIMESTER VI": ["TRIMESTER 6", "SEMESTER VI", "SEMESTER 6"],
-    "FINAL CGPA": ["CGPA", "FINAL_GPA"],
-    "Total Credits": ["TOTAL CREDITS", "TOTAL_CREDITS"],
-    "Total Grade Points": ["TOTAL GRADE POINTS", "TOTAL_GRADE_POINTS"],
-    "Total Marks Obtained": ["TOTAL MARKS", "TOTAL MARKS OBTAINED", "TOTAL_MARKS_OBTAINED"],
-    "Result Declared On": ["RESULT DATE", "DECLARED ON", "RESULT_DECLARED_ON"],
+    "student_name": [
+        "name",
+        "student name",
+        "candidate name",
+        "learner_name",
+    ],
+    "course_name": [
+        "course",
+        "course name",
+        "program",
+        "programme",
+        "examination",
+        "specialization",
+        "specialisation",
+    ],
+    "issue_date": [
+        "date",
+        "issue date",
+        "issued on",
+        "awarded on",
+        "result declared on",
+        "declared on",
+        "held in",
+    ],
+    "certificate_id": [
+        "certificate number",
+        "certificate no",
+        "certificate id",
+        "id",
+        "credential id",
+        "serial number",
+        "seat number",
+        "seat no",
+        "roll number",
+        "roll no",
+        "aicte number",
+        "aicte no",
+    ],
+    "issuer": [
+        "issuing authority",
+        "issued by",
+        "organization",
+        "organisation",
+        "institute",
+        "institution",
+        "university",
+        "board",
+    ],
 }
 
 
@@ -159,7 +178,7 @@ class CertificateExtractor:
     def _build_prompt(self) -> str:
         keys = ", ".join([*TARGET_FIELDS, "confidence_score"])
         return (
-            "Extract marksheet/certificate info from the attached image(s) and output STRICT JSON with keys: "
+            "Extract certificate details from the attached image(s) and output STRICT JSON with keys: "
             f"{keys}.\n"
             "Use null if unknown. confidence_score must be float 0..1. No extra text."
         )
@@ -348,13 +367,16 @@ class CertificateExtractor:
                     return candidate
             return None
 
-        raw_conf = data.get("confidence_score", 0.0)
-        try:
-            confidence = float(raw_conf)
-        except (TypeError, ValueError):
-            confidence = 0.0
-        confidence = max(0.0, min(1.0, confidence))
-
         normalized: dict[str, Any] = {field: get_value(field) for field in TARGET_FIELDS}
+        raw_conf = data.get("confidence_score", None)
+        if raw_conf is not None:
+            try:
+                confidence = float(raw_conf)
+            except (TypeError, ValueError):
+                confidence = 0.0
+        else:
+            filled = sum(1 for field in TARGET_FIELDS if normalized.get(field))
+            confidence = 0.0 if filled == 0 else min(0.95, 0.45 + (0.1 * filled))
+        confidence = max(0.0, min(1.0, confidence))
         normalized["confidence_score"] = confidence
         return normalized
