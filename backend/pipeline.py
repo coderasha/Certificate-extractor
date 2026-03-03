@@ -1,3 +1,5 @@
+from typing import Any
+
 from backend.speed_modes import MODE_CONFIG
 from extractor import CertificateExtractor
 
@@ -8,8 +10,9 @@ def run_pipeline(
     model: str = "llama3.2-vision",
     ollama_url: str = "http://localhost:11434/api/chat",
     timeout_override: int | None = None,
-) -> dict:
-    config = MODE_CONFIG.get(mode, MODE_CONFIG["Balanced"])
+    include_debug: bool = False,
+) -> Any:
+    config = MODE_CONFIG.get(mode, MODE_CONFIG["High Accuracy"])
     timeout = timeout_override if timeout_override is not None else config["timeout"]
 
     extractor = CertificateExtractor(
@@ -21,4 +24,7 @@ def run_pipeline(
         max_image_dim=config["max_image_dim"],
         jpeg_quality=config["jpeg_quality"],
     )
+
+    if include_debug:
+        return extractor.extract_with_debug(file_path)
     return extractor.extract(file_path)

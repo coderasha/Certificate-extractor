@@ -7,6 +7,8 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 
+import pdfplumber
+import pytesseract
 import requests
 from pdf2image import convert_from_path, pdfinfo_from_path
 from PIL import Image
@@ -60,11 +62,7 @@ DETAILED_SECTION_DEFAULTS = {
 }
 
 ALIASES = {
-    "student_name": [
-        "student name",
-        "candidate name",
-        "learner_name",
-    ],
+    "student_name": ["student name", "candidate name", "learner_name"],
     "course_name": [
         "course",
         "course name",
@@ -116,10 +114,10 @@ class CertificateExtractor:
         model: str = "llama3.2-vision",
         ollama_url: str = "http://localhost:11434/api/chat",
         timeout: int = 180,
-        max_pdf_pages: int = 2,
-        vision_dpi: int = 130,
-        max_image_dim: int = 1200,
-        jpeg_quality: int = 62,
+        max_pdf_pages: int = 3,
+        vision_dpi: int = 160,
+        max_image_dim: int = 1600,
+        jpeg_quality: int = 80,
     ) -> None:
         self.model = model
         self.ollama_url = ollama_url
@@ -130,6 +128,13 @@ class CertificateExtractor:
         self.jpeg_quality = jpeg_quality
 
     def extract(self, file_path: str) -> dict[str, Any]:
+        result, _ = self._extract(file_path)
+        return result
+
+    def extract_with_debug(self, file_path: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        return self._extract(file_path)
+
+    def _extract(self, file_path: str) -> tuple[dict[str, Any], dict[str, Any]]:
         path = Path(file_path)
         if not path.exists() or not path.is_file():
             raise FileNotFoundError(f"Input file not found: {file_path}")
@@ -138,20 +143,21 @@ class CertificateExtractor:
         if not images:
             raise ValueError("Unable to prepare visual inputs from file")
 
-        return self.extract_structured_data(images)
+        text_context = self._extract_text_context(path)
+        return self.extract_structured_data(images=images, text_context=text_context)
 
-    def extract_structured_data(self, images: list[str]) -> dict[str, Any]:
+    def extract_structured_data(self, images: list[str], text_context: str) -> tuple[dict[str, Any], dict[str, Any]]:
         payload = {
             "model": self.model,
             "format": "json",
             "messages": [
                 {
                     "role": "system",
-                    "content": "You extract certificate data. Return strict JSON only.",
+                    "content": "You extract certificate data accurately. Return strict JSON only.",
                 },
                 {
                     "role": "user",
-                    "content": self._build_prompt(),
+                    "content": self._build_prompt(text_context),
                     "images": images,
                 },
             ],
@@ -159,25 +165,41 @@ class CertificateExtractor:
             "keep_alive": "30m",
             "options": {
                 "temperature": 0,
-                "num_predict": 180 if len(images) == 1 else 240,
+                "num_predict": 420,
             },
+        }
+
+        debug_info: dict[str, Any] = {
+            "model": self.model,
+            "images_count": len(images),
+            "text_context_preview": text_context[:1800],
+            "raw_model_content": "",
+            "repair_model_content": "",
+            "status": "started",
         }
 
         response = self._post_with_fallback(payload)
         body = response.json()
         raw_content = body.get("message", {}).get("content", "")
+        debug_info["raw_model_content"] = raw_content
 
         if not raw_content:
-            return self._normalize_result({})
+            debug_info["status"] = "empty_model_content"
+            return self._normalize_result({}), debug_info
 
         try:
             parsed = self._parse_model_json(raw_content)
-            return self._normalize_result(parsed)
+            debug_info["status"] = "parsed_direct"
+            return self._normalize_result(parsed), debug_info
         except ValueError:
-            repaired = self._repair_json_response(raw_content)
+            repaired, repair_raw = self._repair_json_response(raw_content)
+            debug_info["repair_model_content"] = repair_raw
             if repaired is not None:
-                return self._normalize_result(repaired)
-            return self._normalize_result({})
+                debug_info["status"] = "parsed_repair"
+                return self._normalize_result(repaired), debug_info
+
+            debug_info["status"] = "parse_failed"
+            return self._normalize_result({}), debug_info
 
     def _post_with_fallback(self, payload: dict[str, Any]) -> requests.Response:
         try:
@@ -188,7 +210,7 @@ class CertificateExtractor:
                 response = requests.post(
                     self.ollama_url,
                     json=fallback,
-                    timeout=min(int(self.timeout * 1.25), 600),
+                    timeout=min(int(self.timeout * 1.3), 600),
                 )
             except requests.RequestException as exc:
                 raise RuntimeError(f"Failed to call LLaMA Vision endpoint: {exc}") from exc
@@ -196,7 +218,7 @@ class CertificateExtractor:
             raise RuntimeError(f"Failed to call LLaMA Vision endpoint: {exc}") from exc
 
         if response.status_code >= 400:
-            body_preview = response.text.strip()[:500]
+            body_preview = response.text.strip()[:700]
             raise RuntimeError(
                 "Failed to call LLaMA Vision endpoint: "
                 f"{response.status_code} {response.reason}. Response: {body_preview}"
@@ -210,20 +232,28 @@ class CertificateExtractor:
         images = user_msg.get("images", [])
         if images:
             user_msg["images"] = images[:1]
-        lighter["options"]["num_predict"] = 140
+        lighter["options"]["num_predict"] = 260
         return lighter
 
-    def _build_prompt(self) -> str:
+    def _build_prompt(self, text_context: str) -> str:
         keys = ", ".join([*TARGET_FIELDS, *DETAILED_SECTION_DEFAULTS.keys(), "confidence_score"])
-        return (
-            "Extract certificate details from the attached image(s) and output STRICT JSON with keys: "
-            f"{keys}.\n"
-            "Use null for unknown values and empty arrays when list sections are unavailable.\n"
-            "For list sections, include all visible entries from the certificate.\n"
-            "confidence_score must be float 0..1. No extra text."
+        context = text_context.strip()
+        context_block = (
+            f"\n\nOCR_TEXT_CONTEXT (may be noisy, use image as source of truth):\n{context[:5000]}"
+            if context
+            else ""
         )
 
-    def _repair_json_response(self, raw_content: str) -> dict[str, Any] | None:
+        return (
+            "Extract all relevant certificate details from the attached image(s) and output STRICT JSON with keys: "
+            f"{keys}.\n"
+            "For list sections (course_details, trimester_wise_performance), include all visible entries.\n"
+            "Use null for unknown scalar values and [] for unknown list sections.\n"
+            "Do not invent values. Do not output any text outside JSON."
+            + context_block
+        )
+
+    def _repair_json_response(self, raw_content: str) -> tuple[dict[str, Any] | None, str]:
         repair_payload = {
             "model": self.model,
             "format": "json",
@@ -237,28 +267,75 @@ class CertificateExtractor:
                     "content": (
                         "Normalize the following extraction output into valid JSON object with these keys only: "
                         + ", ".join([*TARGET_FIELDS, *DETAILED_SECTION_DEFAULTS.keys(), "confidence_score"])
-                        + ". Use null for missing fields. Return JSON only.\n\n"
-                        + raw_content[:3500]
+                        + ". Use null for missing scalar fields and [] for missing list fields. Return JSON only.\n\n"
+                        + raw_content[:5000]
                     ),
                 },
             ],
             "stream": False,
             "keep_alive": "30m",
-            "options": {"temperature": 0, "num_predict": 140},
+            "options": {"temperature": 0, "num_predict": 300},
         }
         try:
             response = requests.post(
                 self.ollama_url,
                 json=repair_payload,
-                timeout=min(max(45, int(self.timeout * 0.6)), 180),
+                timeout=min(max(60, int(self.timeout * 0.7)), 240),
             )
             response.raise_for_status()
             content = response.json().get("message", {}).get("content", "")
             if not content:
-                return None
-            return self._parse_model_json(content)
+                return None, ""
+            return self._parse_model_json(content), content
         except Exception:
-            return None
+            return None, ""
+
+    def _extract_text_context(self, path: Path) -> str:
+        suffix = path.suffix.lower()
+        chunks: list[str] = []
+
+        if suffix == ".pdf":
+            # Direct text first (best quality when embedded).
+            try:
+                with pdfplumber.open(path) as pdf:
+                    upto = min(len(pdf.pages), self.max_pdf_pages)
+                    for idx in range(upto):
+                        text = (pdf.pages[idx].extract_text() or "").strip()
+                        if text:
+                            chunks.append(f"[PDF_TEXT_PAGE_{idx + 1}]\n{text}")
+            except Exception:
+                pass
+
+            # OCR helps for scanned PDFs.
+            try:
+                ocr_last = min(self.max_pdf_pages, 2)
+                if ocr_last > 0:
+                    ocr_images = convert_from_path(
+                        str(path),
+                        dpi=max(190, self.vision_dpi),
+                        fmt="jpeg",
+                        first_page=1,
+                        last_page=ocr_last,
+                        thread_count=2,
+                    )
+                    for idx, image in enumerate(ocr_images, start=1):
+                        text = pytesseract.image_to_string(image).strip()
+                        if text:
+                            chunks.append(f"[OCR_PAGE_{idx}]\n{text}")
+            except Exception:
+                pass
+
+            return "\n\n".join(chunks)[:6000]
+
+        if suffix in {".png", ".jpg", ".jpeg", ".webp", ".tiff", ".bmp"}:
+            try:
+                with Image.open(path) as image:
+                    text = pytesseract.image_to_string(image).strip()
+                return text[:4500] if text else ""
+            except Exception:
+                return ""
+
+        return ""
 
     def _prepare_visual_inputs(self, path: Path) -> list[str]:
         suffix = path.suffix.lower()
@@ -279,9 +356,7 @@ class CertificateExtractor:
             return [self._pil_image_to_b64(image) for image in page_images]
 
         if suffix not in {".png", ".jpg", ".jpeg", ".webp", ".tiff", ".bmp"}:
-            raise ValueError(
-                "Unsupported file type. Supported types: PDF, PNG, JPG, JPEG, WEBP, TIFF, BMP"
-            )
+            raise ValueError("Unsupported file type. Supported types: PDF, PNG, JPG, JPEG, WEBP, TIFF, BMP")
 
         with Image.open(path) as image:
             return [self._pil_image_to_b64(image)]
@@ -433,7 +508,6 @@ class CertificateExtractor:
             DETAILED_SECTION_DEFAULTS["result_declaration"],
         )
 
-        # Fill key detailed fields from top-level aliases when nested section is absent/empty.
         if not normalized["student_details"].get("name"):
             normalized["student_details"]["name"] = normalized["student_name"]
         if not normalized["student_details"].get("examination"):
@@ -445,7 +519,6 @@ class CertificateExtractor:
         if not normalized["institute_details"].get("name"):
             normalized["institute_details"]["name"] = normalized["issuer"]
 
-        # Fill top-level fields from nested sections when available.
         if not normalized["student_name"]:
             normalized["student_name"] = normalized["student_details"].get("name")
         if not normalized["course_name"]:
