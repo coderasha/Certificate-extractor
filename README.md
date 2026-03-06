@@ -1,6 +1,6 @@
-# Certificate Extractor
+# Intelligent Certificate Extractor
 
-Upload a certificate (PDF/image) and send it to LLaMA Vision 3.2. 
+Upload certificates (PDF/image), teach template-specific examples, and automatically extract fields from similar certificates.
 
 ## Output JSON Fields
 - `student_name`
@@ -31,9 +31,51 @@ Upload a certificate (PDF/image) and send it to LLaMA Vision 3.2.
 ## Run Frontend
 `streamlit run app.py`
 
-Then open the URL shown by Streamlit (usually `http://localhost:8501`), upload a certificate, select **High Accuracy**, and click **Extract Data**.
+Then open the URL shown by Streamlit (usually `http://localhost:8501`).
+
+## Teach Template (Learning Mode)
+1. Open the **Teach Template** tab.
+2. Upload a certificate that represents a template you want to learn.
+3. Create/select a template and fill (or auto-fill then correct) these fields:
+   - `student_name`
+   - `course_name`
+   - `issue_date`
+   - `certificate_id`
+   - `issuer`
+4. Optional: enable **Train with full labeled JSON (all relevant fields)** and provide the complete corrected JSON for nested/extended fields.
+5. Click **Save Training Example**.
+
+The app stores template learning data in `storage/template_learning/templates.json` and improves as you add more examples.
+
+## Extract (Inference Mode)
+1. Open the **Extract** tab.
+2. Upload a new certificate and run extraction.
+3. The pipeline now:
+   - tries template matching/layout extraction first
+   - merges template result with LLaMA Vision + OCR extraction
+   - prefers learned template fields when template confidence is high
+4. If any field is wrong, use **Improve Accuracy With Corrections** under the result:
+   - edit corrected values
+   - optional: enable **Train with full labeled JSON (all relevant fields)** to train nested sections too
+   - select/create a template
+   - click **Save Corrections As Training Example**
+
+This creates a continuous learning loop where corrected predictions immediately become new training data.
 
 Tip: Enable **Show raw model debug** in the sidebar to inspect raw Ollama output when results are empty.
 
 ## Run CLI
 `python main.py /path/to/certificate.pdf --pretty`
+
+## Measure Accuracy
+Create ground-truth JSON files in `evaluation/ground_truth/` named as `<input_stem>.json`.
+
+Evaluate one file:
+`python scripts/evaluate_accuracy.py --input-file storage/uploads/RBLDCBH759-M.pdf`
+
+Evaluate a folder and save report:
+`python scripts/evaluate_accuracy.py --input-dir storage/uploads --report-file evaluation/report.json`
+
+Notes:
+- By default `confidence_score` is excluded from accuracy scoring.
+- Use `--include-confidence` if you want to include it.
