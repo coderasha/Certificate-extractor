@@ -28,7 +28,7 @@ Upload a certificate (PDF/image) and send it to LLaMA Vision 3.2.
    - `ollama pull llama3.2-vision`
    - `ollama serve`
 
-## Run Frontend (Streamlit)
+## Run Frontend
 `streamlit run app.py`
 
 Then open the URL shown by Streamlit (usually `http://localhost:8501`), upload a certificate, select **High Accuracy**, and click **Extract Data**.
