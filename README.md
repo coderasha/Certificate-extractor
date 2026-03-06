@@ -1,6 +1,6 @@
 # Certificate Extractor
 
-Upload a certificate (PDF/image) and send it to LLaMA Vision 3.2. The app also includes OCR text context to improve extraction for dense grade cards and scanned PDFs.
+Upload a certificate (PDF/image) and send it to LLaMA Vision 3.2. 
 
 ## Output JSON Fields
 - `student_name`
