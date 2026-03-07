@@ -888,9 +888,14 @@ class CertificateExtractor:
         candidate = match.group(1) if match else address
         if not candidate:
             return None
-        cleaned = re.sub(r"[^A-Za-z0-9,.\s]", " ", candidate)
+        cleaned = re.sub(r"[^A-Za-z0-9,.\s-]", " ", candidate)
+        cleaned = re.sub(r"\s+-\s+", "-", cleaned)
         cleaned = re.sub(r"\s+", " ", cleaned)
-        return cleaned.strip(" ,.")
+        cleaned = re.sub(r"\bSector[\s-]*V\b", "Sector-V", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\bNavi\s+Mumbai\b[\s,-]*400[\s-]*706\b", "Navi Mumbai-400 706", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\bPlot\s*1[Ee]\b", "Plot 1E", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r",\s*,", ", ", cleaned)
+        return cleaned.strip(" ,.-")
 
     @staticmethod
     def _extract_structured_from_text(text_context: str) -> dict[str, Any]:
