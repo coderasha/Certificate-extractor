@@ -3,4 +3,3 @@ pdf2image
 Pillow
 pdfplumber
 pytesseract
-requests

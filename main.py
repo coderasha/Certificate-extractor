@@ -7,24 +7,14 @@ from extractor import CertificateExtractor
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Extract structured certificate data from a PDF or image file."
+        description="Extract structured certificate data from a PDF or image file using OCR + template learning."
     )
     parser.add_argument("input_file", help="Path to certificate file (PDF/image)")
-    parser.add_argument(
-        "--model",
-        default="llama3.2-vision",
-        help="LLaMA Vision model name served by Ollama",
-    )
-    parser.add_argument(
-        "--ollama-url",
-        default="http://localhost:11434/api/chat",
-        help="Ollama chat endpoint URL",
-    )
     parser.add_argument(
         "--timeout",
         type=int,
         default=120,
-        help="Request timeout in seconds",
+        help="OCR processing timeout budget in seconds",
     )
     parser.add_argument(
         "--pretty",
@@ -39,8 +29,6 @@ def main() -> int:
     args = parser.parse_args()
 
     extractor = CertificateExtractor(
-        model=args.model,
-        ollama_url=args.ollama_url,
         timeout=args.timeout,
     )
 

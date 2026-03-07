@@ -24,9 +24,6 @@ Upload certificates (PDF/image), teach template-specific examples, and automatic
 3. Install system dependencies:
    - Poppler (`pdftoppm`) required by `pdf2image`
    - Tesseract OCR binary (`tesseract`) required by `pytesseract`
-4. Start Ollama with a vision model available, for example:
-   - `ollama pull llama3.2-vision`
-   - `ollama serve`
 
 ## Run Frontend
 `streamlit run app.py`
@@ -52,7 +49,7 @@ The app stores template learning data in `storage/template_learning/templates.js
 2. Upload a new certificate and run extraction.
 3. The pipeline now:
    - tries template matching/layout extraction first
-   - merges template result with LLaMA Vision + OCR extraction
+   - merges template result with OCR + rule-based extraction
    - prefers learned template fields when template confidence is high
 4. If any field is wrong, use **Improve Accuracy With Corrections** under the result:
    - edit corrected values
@@ -62,7 +59,7 @@ The app stores template learning data in `storage/template_learning/templates.js
 
 This creates a continuous learning loop where corrected predictions immediately become new training data.
 
-Tip: Enable **Show raw model debug** in the sidebar to inspect raw Ollama output when results are empty.
+Tip: Enable **Show OCR debug** in the sidebar to inspect OCR text context and extraction status.
 
 ## Run CLI
 `python main.py /path/to/certificate.pdf --pretty`

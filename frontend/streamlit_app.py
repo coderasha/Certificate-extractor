@@ -11,6 +11,128 @@ from frontend.components.preview_panel import show_preview
 from frontend.utils.file_handler import save_uploaded_file
 
 
+FIELD_LABELS: dict[str, str] = {
+    "name": "Name",
+    "examination": "Examination",
+    "held_in": "Held In",
+    "seat_number": "Seat Number",
+    "specialisation": "Specialisation",
+    "aicte_number": "AICTE Number",
+    "course_code": "Course Code",
+    "course_title": "Course Title",
+    "maximum_marks": "Maximum Marks",
+    "minimum_marks": "Minimum Marks",
+    "marks_obtained": "Marks Obtained",
+    "course_credits": "Course Credits",
+    "grade": "Grade",
+    "credits_earned_c": "Credits Earned (C)",
+    "grade_points_g": "Grade Points (G)",
+    "cxg": "CxG",
+    "remark": "Remark",
+    "percentage": "Percentage",
+    "gpa": "GPA",
+    "overall_grade": "Overall Grade",
+    "range": "Range",
+    "trimester_i": "Trimester I",
+    "trimester_ii": "Trimester II",
+    "trimester_iii": "Trimester III",
+    "trimester_iv": "Trimester IV",
+    "trimester_v": "Trimester V",
+    "trimester_vi": "Trimester VI",
+    "final_cgpa": "FINAL CGPA",
+    "total_credits": "Total Credits",
+    "total_grade_points": "Total Grade Points",
+    "total_marks_obtained": "Total Marks Obtained",
+    "result_declared_on": "Result Declared On",
+}
+
+FIELD_PATHS: dict[str, list[str]] = {
+    "name": ["student_details.name", "student_name"],
+    "examination": ["student_details.examination", "course_name"],
+    "held_in": ["student_details.held_in", "issue_date"],
+    "seat_number": ["student_details.seat_number", "certificate_id"],
+    "specialisation": ["student_details.specialization"],
+    "aicte_number": ["student_details.aicte_number"],
+    "course_code": ["course_details.0.course_code"],
+    "course_title": ["course_details.0.course_title"],
+    "maximum_marks": ["course_details.0.maximum_marks", "result_summary.total_maximum_marks"],
+    "minimum_marks": ["course_details.0.minimum_marks"],
+    "marks_obtained": ["course_details.0.marks_obtained", "result_summary.total_marks_obtained"],
+    "course_credits": ["course_details.0.course_credits"],
+    "grade": ["course_details.0.grade"],
+    "credits_earned_c": ["course_details.0.credits_earned"],
+    "grade_points_g": ["course_details.0.grade_points"],
+    "cxg": ["course_details.0.cxg"],
+    "remark": ["course_details.0.remark", "result_summary.result"],
+    "percentage": ["result_summary.percentage"],
+    "gpa": ["result_summary.gpa"],
+    "overall_grade": ["result_summary.overall_grade"],
+    "range": ["result_summary.grade_range"],
+    "trimester_i": ["trimester_wise_performance.0"],
+    "trimester_ii": ["trimester_wise_performance.1"],
+    "trimester_iii": ["trimester_wise_performance.2"],
+    "trimester_iv": ["trimester_wise_performance.3"],
+    "trimester_v": ["trimester_wise_performance.4"],
+    "trimester_vi": ["trimester_wise_performance.5"],
+    "final_cgpa": ["final_summary.final_cgpa"],
+    "total_credits": ["final_summary.total_credits"],
+    "total_grade_points": ["final_summary.total_grade_points"],
+    "total_marks_obtained": ["final_summary.total_marks_obtained", "result_summary.total_marks_obtained"],
+    "result_declared_on": ["result_declaration.result_declared_on", "issue_date"],
+}
+
+
+def _field_label(field: str) -> str:
+    return FIELD_LABELS.get(field, field.replace("_", " ").title())
+
+
+def _get_by_dotted_path(payload: dict[str, object], dotted_path: str) -> object | None:
+    current: object = payload
+    for part in dotted_path.split("."):
+        if isinstance(current, dict):
+            current = current.get(part)
+            continue
+        if isinstance(current, list) and part.isdigit():
+            idx = int(part)
+            if 0 <= idx < len(current):
+                current = current[idx]
+                continue
+        return None
+    return current
+
+
+def _trimester_to_text(value: object) -> str:
+    if not isinstance(value, dict):
+        return ""
+    ordered_keys = ["credits_earned", "marks", "percentage", "gpa"]
+    parts = [f"{key}: {value.get(key)}" for key in ordered_keys if value.get(key)]
+    if parts:
+        return ", ".join(parts)
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _resolve_field_value(extracted_result: dict[str, object], field: str) -> str:
+    raw = extracted_result.get(field)
+    if raw is not None and str(raw).strip():
+        return str(raw).strip()
+
+    for dotted_path in FIELD_PATHS.get(field, []):
+        value = _get_by_dotted_path(extracted_result, dotted_path)
+        if value is None:
+            continue
+        if field.startswith("trimester_"):
+            text = _trimester_to_text(value)
+            if text:
+                return text
+            continue
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False)
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
 def _show_template_learning_status(engine: TemplateLearningEngine) -> None:
     templates = engine.list_templates()
     if not templates:
@@ -89,8 +211,8 @@ def _render_feedback_form(engine: TemplateLearningEngine, file_path: str, extrac
     for field in LEARNABLE_FIELDS:
         field_key = f"extract_feedback_field_{field}"
         if field_key not in st.session_state:
-            st.session_state[field_key] = extracted_result.get(field) or ""
-        annotations[field] = st.text_input(field.replace("_", " ").title(), key=field_key)
+            st.session_state[field_key] = _resolve_field_value(extracted_result, field)
+        annotations[field] = st.text_input(_field_label(field), key=field_key)
 
     include_all_fields = st.checkbox(
         "Train with full labeled JSON (all relevant fields)",
@@ -132,8 +254,6 @@ def _render_feedback_form(engine: TemplateLearningEngine, file_path: str, extrac
 
 def _extract_tab(
     engine: TemplateLearningEngine,
-    model: str,
-    ollama_url: str,
     timeout: int,
     use_custom_timeout: bool,
     show_debug: bool,
@@ -154,8 +274,6 @@ def _extract_tab(
                 output = run_pipeline(
                     file_path=file_path,
                     mode=mode,
-                    model=model,
-                    ollama_url=ollama_url,
                     timeout_override=int(timeout) if use_custom_timeout else None,
                     include_debug=show_debug,
                 )
@@ -178,7 +296,7 @@ def _extract_tab(
         st.session_state["extract_feedback_suggested_template_name"] = template_name
         st.session_state["extract_feedback_full_json"] = json.dumps(result, indent=2, ensure_ascii=False)
         for field in LEARNABLE_FIELDS:
-            st.session_state[f"extract_feedback_field_{field}"] = result.get(field) or ""
+            st.session_state[f"extract_feedback_field_{field}"] = _resolve_field_value(result, field)
 
     result = st.session_state.get("extract_last_result")
     debug_info = st.session_state.get("extract_last_debug")
@@ -193,17 +311,10 @@ def _extract_tab(
         _render_feedback_form(engine=engine, file_path=feedback_file_path, extracted_result=result)
 
     if debug_info is not None:
-        with st.expander("Debug: Ollama raw response"):
+        with st.expander("Debug: OCR extraction"):
             st.caption(f"Status: {debug_info.get('status', 'unknown')}")
-            st.caption(f"Images sent: {debug_info.get('images_count', 0)}")
             st.text_area("Text context preview", value=debug_info.get("text_context_preview", ""), height=180)
-            st.text_area("Raw model content", value=debug_info.get("raw_model_content", ""), height=220)
-            if debug_info.get("repair_model_content"):
-                st.text_area(
-                    "Repair model content",
-                    value=debug_info.get("repair_model_content", ""),
-                    height=180,
-                )
+            st.caption(f"OCR text size: {debug_info.get('ocr_chars', 0)} characters")
 
         with st.expander("Debug: Template learning"):
             template_debug = debug_info.get("template_learning", {})
@@ -212,8 +323,6 @@ def _extract_tab(
 
 def _teach_template_tab(
     engine: TemplateLearningEngine,
-    model: str,
-    ollama_url: str,
     timeout: int,
     use_custom_timeout: bool,
 ) -> None:
@@ -250,13 +359,11 @@ def _teach_template_tab(
                 output = run_pipeline(
                     file_path=file_path,
                     mode="High Accuracy",
-                    model=model,
-                    ollama_url=ollama_url,
                     timeout_override=int(timeout) if use_custom_timeout else None,
                     include_debug=False,
                 )
                 for field in LEARNABLE_FIELDS:
-                    st.session_state[f"teach_field_{field}"] = output.get(field) or ""
+                    st.session_state[f"teach_field_{field}"] = _resolve_field_value(output, field)
                 st.session_state["teach_full_json"] = json.dumps(output, indent=2, ensure_ascii=False)
             except Exception as exc:
                 st.error(f"Auto-fill failed: {exc}")
@@ -266,7 +373,7 @@ def _teach_template_tab(
         field_key = f"teach_field_{field}"
         if field_key not in st.session_state:
             st.session_state[field_key] = ""
-        annotations[field] = st.text_input(field.replace("_", " ").title(), key=field_key)
+        annotations[field] = st.text_input(_field_label(field), key=field_key)
 
     include_all_fields = st.checkbox(
         "Train with full labeled JSON (all relevant fields)",
@@ -329,12 +436,10 @@ def main() -> None:
 
     template_engine = TemplateLearningEngine()
     with st.sidebar:
-        st.subheader("Model Settings")
-        model = st.text_input("Model", value="llama3.2-vision")
-        ollama_url = st.text_input("Ollama URL", value="http://localhost:11434/api/chat")
+        st.subheader("OCR Settings")
         use_custom_timeout = st.checkbox("Use custom timeout", value=False)
         timeout = st.number_input("Timeout (seconds)", min_value=30, max_value=1200, value=240)
-        show_debug = st.checkbox("Show raw model debug", value=False)
+        show_debug = st.checkbox("Show OCR debug", value=False)
         st.divider()
         st.subheader("Template Learner")
         _show_template_learning_status(template_engine)
@@ -343,8 +448,6 @@ def main() -> None:
     with tab_extract:
         _extract_tab(
             engine=template_engine,
-            model=model,
-            ollama_url=ollama_url,
             timeout=int(timeout),
             use_custom_timeout=use_custom_timeout,
             show_debug=show_debug,
@@ -352,8 +455,6 @@ def main() -> None:
     with tab_teach:
         _teach_template_tab(
             engine=template_engine,
-            model=model,
-            ollama_url=ollama_url,
             timeout=int(timeout),
             use_custom_timeout=use_custom_timeout,
         )

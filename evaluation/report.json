@@ -1,0 +1,26 @@
+{
+  "files": [
+    {
+      "input_file": "storage/uploads/RBLDCBH759-M.pdf",
+      "ground_truth_file": "evaluation/ground_truth/RBLDCBH759-M.json",
+      "accuracy_percent": 96.3,
+      "matched_fields": 52,
+      "scored_fields": 54,
+      "mismatches": [
+        {
+          "path": "student_details.name",
+          "expected": "Shetty Saksham Harish Usha",
+          "predicted": "Shetty Saichant Harish Usha"
+        },
+        {
+          "path": "student_name",
+          "expected": "Shetty Saksham Harish Usha",
+          "predicted": "Shetty Saichant Harish Usha"
+        }
+      ]
+    }
+  ],
+  "overall_accuracy_percent": 96.3,
+  "overall_matched_fields": 52,
+  "overall_scored_fields": 54
+}
