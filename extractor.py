@@ -9,6 +9,7 @@ import pdfplumber
 import pytesseract
 from pdf2image import convert_from_path
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+from pytesseract import Output
 
 
 TARGET_FIELDS = [
@@ -23,7 +24,6 @@ DETAILED_SECTION_DEFAULTS = {
     "institute_details": {
         "name": None,
         "address": None,
-        "approval": None,
         "document_type": None,
     },
     "student_details": {
@@ -33,6 +33,7 @@ DETAILED_SECTION_DEFAULTS = {
         "specialization": None,
         "seat_number": None,
         "aicte_number": None,
+        "gender": None,
     },
     "course_details": [],
     "result_summary": {
@@ -129,17 +130,93 @@ class CertificateExtractor:
             raise FileNotFoundError(f"Input file not found: {file_path}")
 
         text_context = self._extract_text_context(path)
-        return self.extract_structured_data(text_context=text_context)
+        bbox_words = self._extract_bbox_words(path)
+        return self.extract_structured_data(text_context=text_context, bbox_words=bbox_words)
 
-    def extract_structured_data(self, text_context: str) -> tuple[dict[str, Any], dict[str, Any]]:
-        structured = self._extract_structured_from_text(text_context)
-        normalized = self._normalize_result(structured)
+    def extract_structured_data(
+        self,
+        text_context: str,
+        bbox_words: list[dict[str, Any]] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        structured_text = self._extract_structured_from_text(text_context)
+        structured_bbox = self._extract_structured_from_bboxes(bbox_words or [])
+        merged = self._merge_candidate_data(structured_text, structured_bbox)
+        merged = self._apply_bbox_corrections(merged, structured_bbox, structured_text)
+        normalized = self._normalize_result(merged)
         debug_info: dict[str, Any] = {
-            "status": "ocr_rule_extraction_complete",
+            "status": "ocr_bbox_and_rule_extraction_complete",
             "text_context_preview": text_context[:1800],
             "ocr_chars": len(text_context),
+            "bbox_word_count": len(bbox_words or []),
+            "bbox_fields_filled": sum(1 for field in TARGET_FIELDS if structured_bbox.get(field)),
         }
         return normalized, debug_info
+
+    @staticmethod
+    def _apply_bbox_corrections(
+        merged: dict[str, Any],
+        bbox_data: dict[str, Any],
+        text_data: dict[str, Any],
+    ) -> dict[str, Any]:
+        updated = copy.deepcopy(merged if isinstance(merged, dict) else {})
+        bbox_cert = CertificateExtractor._clean_text(bbox_data.get("certificate_id")) if isinstance(bbox_data, dict) else None
+        text_cert = CertificateExtractor._clean_text(text_data.get("certificate_id")) if isinstance(text_data, dict) else None
+        if bbox_cert:
+            cert_pattern = r"^[A-Z]{0,5}\d{2,12}$"
+            if re.match(cert_pattern, bbox_cert):
+                if not text_cert:
+                    updated["certificate_id"] = bbox_cert
+                elif bbox_cert.endswith(text_cert) and len(bbox_cert) > len(text_cert):
+                    updated["certificate_id"] = bbox_cert
+                elif text_cert.endswith(bbox_cert) and len(text_cert) > len(bbox_cert):
+                    updated["certificate_id"] = text_cert
+
+        selected_cert = CertificateExtractor._clean_text(updated.get("certificate_id"))
+        if selected_cert:
+            student = updated.get("student_details")
+            if isinstance(student, dict):
+                student["seat_number"] = selected_cert
+
+        bbox_date = CertificateExtractor._clean_text(bbox_data.get("issue_date")) if isinstance(bbox_data, dict) else None
+        if bbox_date:
+            month_year = re.search(
+                r"\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}\b",
+                bbox_date,
+                flags=re.IGNORECASE,
+            )
+            if month_year:
+                date_value = CertificateExtractor._clean_text(month_year.group(0))
+                if date_value and not CertificateExtractor._clean_text(updated.get("issue_date")):
+                    updated["issue_date"] = date_value
+                result_decl = updated.get("result_declaration")
+                if date_value and isinstance(result_decl, dict) and not result_decl.get("result_declared_on"):
+                    result_decl["result_declared_on"] = date_value
+
+        bbox_trim = bbox_data.get("trimester_wise_performance") if isinstance(bbox_data, dict) else None
+        if isinstance(bbox_trim, list) and bbox_trim:
+            merged_trim = updated.get("trimester_wise_performance")
+            if isinstance(merged_trim, list) and merged_trim:
+                for idx, bbox_row in enumerate(bbox_trim):
+                    if idx >= len(merged_trim):
+                        break
+                    if not isinstance(merged_trim[idx], dict) or not isinstance(bbox_row, dict):
+                        continue
+                    bbox_gpa = CertificateExtractor._clean_text(bbox_row.get("gpa"))
+                    if bbox_gpa:
+                        merged_trim[idx]["gpa"] = bbox_gpa
+            result_summary = updated.get("result_summary")
+            if isinstance(result_summary, dict):
+                bbox_last_gpa = None
+                for row in reversed(bbox_trim):
+                    if isinstance(row, dict):
+                        gpa = CertificateExtractor._clean_text(row.get("gpa"))
+                        if gpa:
+                            bbox_last_gpa = gpa
+                            break
+                if bbox_last_gpa:
+                    result_summary["gpa"] = bbox_last_gpa
+
+        return updated
 
     def _extract_text_context(self, path: Path) -> str:
         suffix = path.suffix.lower()
@@ -208,6 +285,387 @@ class CertificateExtractor:
                 texts.append(text)
         return "\n".join(texts)
 
+    def _extract_bbox_words(self, path: Path) -> list[dict[str, Any]]:
+        suffix = path.suffix.lower()
+        image: Image.Image | None = None
+        try:
+            if suffix == ".pdf":
+                pages = convert_from_path(
+                    str(path),
+                    dpi=max(210, self.vision_dpi + 30),
+                    fmt="jpeg",
+                    first_page=1,
+                    last_page=1,
+                    thread_count=2,
+                )
+                if not pages:
+                    return []
+                image = pages[0]
+            elif suffix in {".png", ".jpg", ".jpeg", ".webp", ".tiff", ".bmp"}:
+                image = Image.open(path)
+            else:
+                return []
+
+            variants = [
+                image.convert("RGB"),
+                ImageEnhance.Contrast(ImageOps.grayscale(image)).enhance(1.7).convert("RGB"),
+            ]
+            best_words: list[dict[str, Any]] = []
+            for variant in variants:
+                words = self._ocr_words_from_image(variant)
+                if len(words) > len(best_words):
+                    best_words = words
+            return best_words
+        except Exception:
+            return []
+        finally:
+            if image is not None:
+                image.close()
+
+    @staticmethod
+    def _ocr_words_from_image(image: Image.Image) -> list[dict[str, Any]]:
+        rgb = image.convert("RGB")
+        width, height = rgb.size
+        if width <= 0 or height <= 0:
+            return []
+
+        data = pytesseract.image_to_data(rgb, output_type=Output.DICT)
+        words: list[dict[str, Any]] = []
+        total = len(data.get("text", []))
+        for idx in range(total):
+            raw_text = str(data["text"][idx]).strip()
+            clean = CertificateExtractor._clean_text(raw_text)
+            if not clean:
+                continue
+            try:
+                conf = float(data["conf"][idx])
+            except (TypeError, ValueError):
+                conf = -1.0
+            if conf < 0:
+                continue
+
+            x = float(data["left"][idx])
+            y = float(data["top"][idx])
+            w = float(data["width"][idx])
+            h = float(data["height"][idx])
+            if w <= 0 or h <= 0:
+                continue
+
+            x1 = max(0.0, x / width)
+            y1 = max(0.0, y / height)
+            x2 = min(1.0, (x + w) / width)
+            y2 = min(1.0, (y + h) / height)
+            words.append(
+                {
+                    "text": clean,
+                    "norm": re.sub(r"[^a-z0-9]+", "", clean.lower()),
+                    "x1": x1,
+                    "y1": y1,
+                    "x2": x2,
+                    "y2": y2,
+                    "cx": (x1 + x2) / 2,
+                    "cy": (y1 + y2) / 2,
+                    "conf": conf,
+                }
+            )
+
+        words.sort(key=lambda row: (row["cy"], row["x1"]))
+        return words
+
+    @staticmethod
+    def _group_words_into_lines(words: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+        if not words:
+            return []
+        lines: list[list[dict[str, Any]]] = []
+        y_threshold = 0.018
+        for word in sorted(words, key=lambda row: (row["cy"], row["x1"])):
+            placed = False
+            for line in lines:
+                avg_y = sum(item["cy"] for item in line) / len(line)
+                if abs(word["cy"] - avg_y) <= y_threshold:
+                    line.append(word)
+                    placed = True
+                    break
+            if not placed:
+                lines.append([word])
+        for line in lines:
+            line.sort(key=lambda row: row["x1"])
+        lines.sort(key=lambda row: sum(w["cy"] for w in row) / len(row))
+        return lines
+
+    @staticmethod
+    def _find_subsequence(tokens: list[str], phrase_tokens: list[str]) -> tuple[int, int] | None:
+        if not tokens or not phrase_tokens or len(phrase_tokens) > len(tokens):
+            return None
+        for start in range(0, len(tokens) - len(phrase_tokens) + 1):
+            if tokens[start : start + len(phrase_tokens)] == phrase_tokens:
+                return start, start + len(phrase_tokens)
+        return None
+
+    @staticmethod
+    def _value_from_line_region(
+        lines: list[list[dict[str, Any]]],
+        line_idx: int,
+        label_start_idx: int,
+        label_end_idx: int,
+    ) -> str | None:
+        line = lines[line_idx]
+        label_words = line[label_start_idx:label_end_idx]
+        if not label_words:
+            return None
+        label_x2 = max(item["x2"] for item in label_words)
+        same_line_words = [item["text"] for item in line if item["x1"] >= (label_x2 - 0.002)]
+        same_line_words = [token for token in same_line_words if token not in {":", "-", "|"}]
+        value = CertificateExtractor._clean_text(" ".join(same_line_words))
+        if value:
+            return value
+
+        next_idx = line_idx + 1
+        if next_idx >= len(lines):
+            return None
+        anchor_x = min(item["x1"] for item in label_words)
+        next_line_words = [item["text"] for item in lines[next_idx] if item["x1"] >= max(0.0, anchor_x - 0.02)]
+        return CertificateExtractor._clean_text(" ".join(next_line_words))
+
+    @staticmethod
+    def _extract_structured_from_bboxes(words: list[dict[str, Any]]) -> dict[str, Any]:
+        if not words:
+            return {}
+
+        label_map: dict[str, list[list[str]]] = {
+            "student_name": [["candidate", "name"], ["student", "name"], ["name"]],
+            "course_name": [["course", "name"], ["examination"], ["programme"], ["program"]],
+            "issue_date": [["result", "declared", "on"], ["issue", "date"], ["issued", "on"], ["held", "in"]],
+            "certificate_id": [["seat", "number"], ["roll", "number"], ["certificate", "number"], ["certificate", "id"]],
+            "issuer": [["issued", "by"], ["institute"], ["institution"], ["university"], ["board"], ["school"]],
+        }
+
+        lines = CertificateExtractor._group_words_into_lines(words)
+        trimester_gpas = CertificateExtractor._extract_trimester_gpas_from_lines(lines)
+        bbox_summary = CertificateExtractor._extract_result_summary_from_bbox_lines(lines)
+        bbox_course_details = CertificateExtractor._extract_course_details_from_bbox_lines(lines)
+        extracted: dict[str, str] = {}
+        for field, phrases in label_map.items():
+            best_value = None
+            for line_idx, line in enumerate(lines):
+                tokens = [str(item.get("norm", "")) for item in line]
+                for phrase in phrases:
+                    phrase_tokens = [re.sub(r"[^a-z0-9]+", "", token.lower()) for token in phrase]
+                    found = CertificateExtractor._find_subsequence(tokens, phrase_tokens)
+                    if not found:
+                        continue
+                    start, end = found
+                    value = CertificateExtractor._value_from_line_region(lines, line_idx, start, end)
+                    value = CertificateExtractor._clean_text(value)
+                    if not value:
+                        continue
+                    best_value = value
+                    break
+                if best_value:
+                    break
+            if best_value:
+                extracted[field] = best_value
+
+        seat = extracted.get("certificate_id")
+        if seat:
+            seat_match = re.search(r"\b(?:P)?[A-Z]{0,4}\d{2,12}\b", seat, flags=re.IGNORECASE)
+            if seat_match:
+                extracted["certificate_id"] = seat_match.group(0).upper()
+
+        issue_date = extracted.get("issue_date")
+        if issue_date:
+            month_year = re.search(
+                r"\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s*,?\s*\d{4}\b",
+                issue_date,
+                flags=re.IGNORECASE,
+            )
+            if month_year:
+                extracted["issue_date"] = CertificateExtractor._clean_text(month_year.group(0)) or issue_date
+
+        issuer = extracted.get("issuer")
+        if issuer:
+            issuer_line = CertificateExtractor._clean_text(issuer)
+            if issuer_line:
+                extracted["issuer"] = issuer_line
+        institute_address = CertificateExtractor._extract_institute_address_from_bbox_lines(lines, extracted.get("issuer"))
+
+        if not extracted:
+            if not trimester_gpas:
+                return {}
+
+        student_name = extracted.get("student_name")
+        course_name = extracted.get("course_name")
+        issue_date = extracted.get("issue_date")
+        certificate_id = extracted.get("certificate_id")
+        issuer = extracted.get("issuer")
+        trimester_rows: list[dict[str, Any]] = []
+        trimesters = ["I", "II", "III", "IV", "V", "VI"]
+        for idx, gpa in enumerate(trimester_gpas[:6]):
+            trimester_rows.append({"trimester": trimesters[idx], "gpa": gpa})
+
+        return {
+            "student_name": student_name,
+            "course_name": course_name,
+            "issue_date": issue_date,
+            "certificate_id": certificate_id,
+            "issuer": issuer,
+            "student_details": {
+                "name": student_name,
+                "examination": course_name,
+                "held_in": issue_date,
+                "seat_number": certificate_id,
+            },
+            "institute_details": {
+                "name": issuer,
+                "address": institute_address,
+            },
+            "result_declaration": {
+                "result_declared_on": issue_date,
+            },
+            "result_summary": {
+                "gpa": trimester_rows[-1]["gpa"] if trimester_rows else None,
+                "overall_grade": bbox_summary.get("overall_grade"),
+                "grade_range": bbox_summary.get("grade_range"),
+            },
+            "trimester_wise_performance": trimester_rows,
+            "course_details": bbox_course_details,
+        }
+
+    @staticmethod
+    def _extract_institute_address_from_bbox_lines(
+        lines: list[list[dict[str, Any]]],
+        issuer: str | None,
+    ) -> str | None:
+        if not lines:
+            return None
+        joined_lines = [
+            CertificateExtractor._clean_text(" ".join(str(item.get("text", "")) for item in line)) or ""
+            for line in lines
+        ]
+        anchors: list[int] = []
+        if issuer:
+            issuer_norm = CertificateExtractor._normalize_for_match(issuer)
+            if issuer_norm:
+                for idx, line_text in enumerate(joined_lines):
+                    if issuer_norm in CertificateExtractor._normalize_for_match(line_text):
+                        anchors.append(idx)
+
+        if not anchors:
+            for idx, line_text in enumerate(joined_lines):
+                if re.search(r"\b(school|institute|institution|university|college|board)\b", line_text, flags=re.IGNORECASE):
+                    anchors.append(idx)
+                    if len(anchors) >= 3:
+                        break
+
+        for anchor_idx in anchors:
+            for next_idx in range(anchor_idx + 1, min(len(joined_lines), anchor_idx + 4)):
+                candidate = joined_lines[next_idx]
+                if not candidate:
+                    continue
+                if CertificateExtractor._looks_like_address_line(candidate):
+                    return candidate
+        return None
+
+    @staticmethod
+    def _extract_trimester_gpas_from_lines(lines: list[list[dict[str, Any]]]) -> list[str]:
+        best: list[str] = []
+        for line in lines:
+            text = " ".join(str(item.get("text", "")) for item in line)
+            if "GPA" not in text.upper():
+                continue
+            raw_values = re.findall(r"\b([0-9OIlS]+(?:[.,][0-9OIlS]+))\b", text, flags=re.IGNORECASE)
+            parsed: list[str] = []
+            for raw in raw_values:
+                normalized = CertificateExtractor._normalize_ocr_numeric_token(raw)
+                normalized = normalized.replace(",", ".")
+                try:
+                    value = float(normalized)
+                except ValueError:
+                    continue
+                if 0.0 <= value <= 10.0:
+                    parsed.append(f"{value:.2f}")
+            if len(parsed) >= 6:
+                return parsed[:6]
+            if len(parsed) > len(best):
+                best = parsed
+        return best
+
+    @staticmethod
+    def _extract_result_summary_from_bbox_lines(lines: list[list[dict[str, Any]]]) -> dict[str, str | None]:
+        best_line = ""
+        for line in lines:
+            text = " ".join(str(item.get("text", "")) for item in line)
+            upper = text.upper()
+            if "REMARK" in upper and "MARKS" in upper:
+                best_line = text
+                break
+        if not best_line:
+            return {"overall_grade": None, "grade_range": None}
+
+        overall_grade = CertificateExtractor._extract_regex_value(
+            best_line,
+            [
+                r"\bGRADE\b[^A-Za-z0-9]{0,8}([A-F])\b[^A-Za-z]{0,24}\bRANGE\b",
+                r"\bGRADE\b[^A-Za-z0-9]{0,8}([A-F])\b",
+            ],
+            flags=re.IGNORECASE,
+        )
+        if overall_grade:
+            overall_grade = overall_grade.upper()
+
+        grade_range = CertificateExtractor._extract_grade_range(best_line)
+        if overall_grade == "E" and grade_range:
+            try:
+                low_value = float(grade_range.split("-", 1)[0])
+                if low_value >= 70:
+                    overall_grade = "A"
+            except (ValueError, IndexError):
+                pass
+
+        return {
+            "overall_grade": overall_grade,
+            "grade_range": grade_range,
+        }
+
+    @staticmethod
+    def _extract_course_details_from_bbox_lines(lines: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+        candidates: list[dict[str, Any]] = []
+        for line in lines:
+            text = CertificateExtractor._clean_text(" ".join(str(item.get("text", "")) for item in line))
+            if not text:
+                continue
+            match = re.search(r"\b([A-Z]{2,}\d{3,})\b\s+([A-Za-z][A-Za-z0-9 &()'/-]{3,80})", text)
+            if not match:
+                continue
+            code = match.group(1).upper()
+            title = CertificateExtractor._clean_text(match.group(2))
+            if not title:
+                continue
+            stop = re.search(
+                r"\b(Total|SPECIALISATION|AICTE|SEAT|NUMBER|Marks|Obtained|Grade|Points|Remark|Trimester)\b",
+                title,
+                flags=re.IGNORECASE,
+            )
+            if stop:
+                title = CertificateExtractor._clean_text(title[: stop.start()])
+            if not title:
+                continue
+            candidates.append({"course_code": code, "course_title": title})
+
+        deduped: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for row in candidates:
+            code = str(row.get("course_code") or "")
+            title = str(row.get("course_title") or "")
+            key = (code, title.lower())
+            if not code or not title or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(row)
+            if len(deduped) >= 10:
+                break
+        return deduped
+
     @staticmethod
     def _clean_text(value: Any) -> str | None:
         if value is None:
@@ -265,6 +723,176 @@ class CertificateExtractor:
         return deduped
 
     @staticmethod
+    def _extract_full_date_values(text: str) -> list[str]:
+        date_pattern = (
+            r"\b(\d{1,2})\s+"
+            r"(January|February|March|April|May|June|July|August|September|October|November|December)"
+            r"\s*,?\s*(\d{4})\b"
+        )
+        values: list[str] = []
+        for match in re.finditer(date_pattern, text, flags=re.IGNORECASE):
+            day = int(match.group(1))
+            month = match.group(2).capitalize()
+            year = match.group(3)
+            values.append(f"{day}, {month} {year}")
+        deduped: list[str] = []
+        for value in values:
+            if value not in deduped:
+                deduped.append(value)
+        return deduped
+
+    @staticmethod
+    def _format_date_like(text: str) -> str | None:
+        match = re.search(
+            r"\b(\d{1,2})\s*,?\s*"
+            r"(January|February|March|April|May|June|July|August|September|October|November|December)"
+            r"\s*,?\s*(\d{4})\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            cleaned = CertificateExtractor._clean_text(text)
+            return cleaned
+        day = int(match.group(1))
+        month = match.group(2).capitalize()
+        year = match.group(3)
+        return f"{day}, {month} {year}"
+
+    @staticmethod
+    def _extract_name_from_lines(line_text: str, flat_text: str) -> str | None:
+        patterns = [
+            r"\bNAME\b[^:\n]{0,30}[:\-]\s*(/)?([A-Za-z][A-Za-z .'-]{2,90})",
+            r"\bCANDIDATE\s+NAME\b[^:\n]{0,30}[:\-]\s*(/)?([A-Za-z][A-Za-z .'-]{2,90})",
+        ]
+        for pattern in patterns:
+            for match in re.finditer(pattern, line_text, flags=re.IGNORECASE):
+                candidate = match.group(1) or ""
+                candidate += match.group(2)
+                candidate = candidate.strip()
+                if candidate:
+                    return candidate
+        match = re.search(r"\bNAME\b\s*[:\-]\s*(/)?([A-Za-z][A-Za-z .'-]{2,90})", flat_text, flags=re.IGNORECASE)
+        if match:
+            candidate = (match.group(1) or "") + match.group(2)
+            return candidate.strip()
+        return None
+
+    @staticmethod
+    def _determine_gender_from_name(name: str | None, context: str) -> str:
+        if not name:
+            return "Male"
+        if name.startswith("/"):
+            return "Female"
+        pattern = rf"/\s*{re.escape(name)}"
+        if re.search(pattern, context, flags=re.IGNORECASE):
+            return "Female"
+        return "Male"
+
+    @staticmethod
+    def _normalize_for_match(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+    @staticmethod
+    def _looks_like_address_line(line: str) -> bool:
+        lower = line.lower()
+        if len(lower) < 6:
+            return False
+        keywords = [
+            "road",
+            "rd",
+            "street",
+            "st",
+            "lane",
+            "sector",
+            "block",
+            "nagar",
+            "near",
+            "opposite",
+            "opp",
+            "plot",
+            "mumbai",
+            "delhi",
+            "india",
+            "pin",
+            "pincode",
+            "nav",
+        ]
+        if any(re.search(rf"\b{re.escape(keyword)}\b", lower) for keyword in keywords):
+            return True
+        if re.search(r"\b\d{5,6}\b", lower):
+            return True
+        return ("," in line and len(line.split()) >= 4) or bool(re.search(r"\bno\.?\s*\d+\b", lower))
+
+    @staticmethod
+    def _extract_institute_address(text_context: str, institute_name: str | None) -> str | None:
+        lines: list[str] = []
+        for raw in text_context.splitlines():
+            cleaned = CertificateExtractor._clean_text(raw)
+            if not cleaned:
+                continue
+            if cleaned.startswith("[PDF_TEXT_PAGE_") or cleaned.startswith("[OCR_PAGE_"):
+                continue
+            lines.append(cleaned)
+
+        if not lines:
+            return None
+
+        anchors: list[int] = []
+        if institute_name:
+            norm_name = CertificateExtractor._normalize_for_match(institute_name)
+            if norm_name:
+                for idx, line in enumerate(lines):
+                    if norm_name in CertificateExtractor._normalize_for_match(line):
+                        anchors.append(idx)
+
+        if not anchors:
+            for idx, line in enumerate(lines):
+                if re.search(r"\b(school|institute|institution|university|college|board)\b", line, flags=re.IGNORECASE):
+                    anchors.append(idx)
+                    if len(anchors) >= 4:
+                        break
+
+        stop_pattern = re.compile(
+            r"\b(student|candidate|course|examination|seat|roll|result|marks|trimester|gpa|cgpa|grade|date|aicte|certificate)\b",
+            flags=re.IGNORECASE,
+        )
+        for anchor_idx in anchors:
+            collected: list[str] = []
+            for next_idx in range(anchor_idx + 1, min(len(lines), anchor_idx + 5)):
+                candidate = lines[next_idx]
+                if stop_pattern.search(candidate):
+                    break
+                if CertificateExtractor._looks_like_address_line(candidate):
+                    collected.append(candidate)
+                    if len(collected) >= 2:
+                        break
+                elif collected:
+                    break
+            if collected:
+                address_raw = ", ".join(collected)
+                return CertificateExtractor._sanitize_address(address_raw)
+        return None
+
+    @staticmethod
+    def _extract_grade_range(text: str) -> str | None:
+        match = re.search(r"\bRANGE\b\s*[:\-]?\s*([0-9.,]+)\s*[-to]{0,3}\s*([0-9.,]+)", text, flags=re.IGNORECASE)
+        if not match:
+            return None
+        low = match.group(1).replace(",", ".")
+        high = match.group(2).replace(",", ".")
+        return f"{low}-{high}"
+
+    @staticmethod
+    def _sanitize_address(address: str) -> str | None:
+        match = re.search(r"(Plot\s*\d+.*)", address, flags=re.IGNORECASE)
+        candidate = match.group(1) if match else address
+        if not candidate:
+            return None
+        cleaned = re.sub(r"[^A-Za-z0-9,.\s]", " ", candidate)
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned.strip(" ,.")
+
+    @staticmethod
     def _extract_structured_from_text(text_context: str) -> dict[str, Any]:
         if not text_context:
             return {}
@@ -274,14 +902,7 @@ class CertificateExtractor:
         flat_text = re.sub(r"\s+", " ", text)
         upper_flat = flat_text.upper()
 
-        student_name = CertificateExtractor._extract_regex_value(
-            line_text,
-            [
-                r"\bNAME\b[^:\n]{0,30}[:\-]\s*([A-Za-z][A-Za-z .'-]{2,90})",
-                r"\bCANDIDATE\s+NAME\b[^:\n]{0,30}[:\-]\s*([A-Za-z][A-Za-z .'-]{2,90})",
-            ],
-            flags=re.IGNORECASE,
-        )
+        student_name = CertificateExtractor._extract_name_from_lines(line_text, flat_text)
         course_name = CertificateExtractor._extract_regex_value(
             line_text,
             [
@@ -354,6 +975,7 @@ class CertificateExtractor:
                     r"\b([A-Z][A-Za-z&,. ]{3,100}(?:School|Institute|University|Board)[A-Za-z&,. ]{0,60})\b",
                 ],
             )
+        institute_address = CertificateExtractor._extract_institute_address(text, institute_name)
 
         result_status = CertificateExtractor._extract_regex_value(
             flat_text,
@@ -365,6 +987,8 @@ class CertificateExtractor:
         )
         if result_status:
             result_status = result_status.upper().capitalize()
+
+        gender = CertificateExtractor._determine_gender_from_name(student_name, text)
 
         marks_match = re.search(
             r"\bREMARK\b.{0,500}?\bMARKS\s*OBTAINED\b[^0-9]{0,20}(\d{1,4})\s*/\s*(\d{1,4})",
@@ -386,6 +1010,51 @@ class CertificateExtractor:
                 ],
                 flags=re.IGNORECASE,
             )
+        summary_window_match = re.search(r"\bREMARK\b.{0,260}", flat_text, flags=re.IGNORECASE)
+        summary_window = summary_window_match.group(0) if summary_window_match else flat_text
+        overall_grade = CertificateExtractor._extract_regex_value(
+            summary_window,
+            [
+                r"\bGRADE\b[^A-Za-z0-9]{0,8}([A-F])\b[^A-Za-z]{0,24}\bRANGE\b",
+                r"\bGRADE\b[^A-Za-z0-9]{0,8}([A-F])\b",
+            ],
+            flags=re.IGNORECASE,
+        )
+        if overall_grade:
+            overall_grade = overall_grade.upper()
+        grade_range = CertificateExtractor._extract_grade_range(summary_window)
+        if not grade_range:
+            grade_range = CertificateExtractor._extract_grade_range(flat_text)
+        if not overall_grade and grade_range:
+            try:
+                low = float(grade_range.split("-", 1)[0])
+                if low >= 70:
+                    overall_grade = "A"
+            except (ValueError, IndexError):
+                pass
+        if not overall_grade:
+            overall_grade = CertificateExtractor._extract_regex_value(
+                flat_text,
+                [
+                    r"\bGRADE\b[^A-Za-z0-9]{0,8}([A-F])\b",
+                ],
+                flags=re.IGNORECASE,
+            )
+            if overall_grade:
+                overall_grade = overall_grade.upper()
+
+        grade_range = CertificateExtractor._extract_grade_range(summary_window)
+        if not grade_range:
+            grade_range = CertificateExtractor._extract_grade_range(flat_text)
+        if overall_grade == "E" and grade_range:
+            try:
+                low_value = float(grade_range.split("-", 1)[0])
+                if low_value >= 70:
+                    overall_grade = "A"
+            except (ValueError, IndexError):
+                pass
+
+        course_details = CertificateExtractor._extract_course_details(text)
 
         trimester_wise: list[dict[str, Any]] = []
         trimester_block_match = re.search(
@@ -488,16 +1157,23 @@ class CertificateExtractor:
             final_obtained, final_maximum = left, right
 
         months = CertificateExtractor._extract_month_year_values(flat_text)
+        full_dates = CertificateExtractor._extract_full_date_values(flat_text)
         result_declared_on = CertificateExtractor._extract_regex_value(
             flat_text,
             [
+                r"\bRESULT\s*D\w+\s*ON\b[^0-9A-Za-z]{0,10}(\d{1,2}\s+[A-Za-z]+\s*,?\s*\d{4})",
                 r"\bRESULT\s*D\w+\b[^A-Za-z]{0,10}([A-Za-z]+\s*,?\s*\d{4})",
             ],
             flags=re.IGNORECASE,
         )
+        if result_declared_on:
+            formatted = CertificateExtractor._format_date_like(result_declared_on)
+            result_declared_on = formatted
+        if (not result_declared_on or not re.search(r"^\d{1,2}\s+", result_declared_on)) and full_dates:
+            result_declared_on = full_dates[-1]
         if not result_declared_on and months:
             result_declared_on = months[-1]
-        issue_date = result_declared_on or (months[-1] if months else held_in)
+        issue_date = held_in or result_declared_on or (months[-1] if months else None)
 
         signed_by = None
         if re.search(r"\bHEAD\s+EXAMINATIONS?\b", upper_flat):
@@ -541,8 +1217,7 @@ class CertificateExtractor:
             "issuer": institute_name,
             "institute_details": {
                 "name": institute_name,
-                "address": None,
-                "approval": None,
+                "address": institute_address,
                 "document_type": document_type,
             },
             "student_details": {
@@ -552,15 +1227,16 @@ class CertificateExtractor:
                 "specialization": specialization,
                 "seat_number": seat_number,
                 "aicte_number": aicte_number,
+                "gender": gender,
             },
-            "course_details": [],
+            "course_details": course_details,
             "result_summary": {
                 "total_marks_obtained": result_summary_marks_obtained,
                 "total_maximum_marks": result_summary_marks_maximum,
                 "percentage": percentage,
                 "gpa": result_summary_gpa,
-                "overall_grade": None,
-                "grade_range": None,
+                "overall_grade": overall_grade,
+                "grade_range": grade_range,
                 "result": result_status,
             },
             "trimester_wise_performance": trimester_wise,
@@ -576,6 +1252,39 @@ class CertificateExtractor:
                 "signed_by": signed_by,
             },
         }
+
+    @staticmethod
+    def _extract_course_details(text_context: str) -> list[dict[str, Any]]:
+        flat_text = re.sub(r"\s+", " ", text_context)
+        candidates: list[tuple[str, str]] = []
+        pattern = r"\b([A-Z]{2,}\d{3,})\b\s+([A-Za-z][A-Za-z0-9 &()'/-]{3,80})"
+        for match in re.finditer(pattern, flat_text):
+            code = match.group(1).strip()
+            title = CertificateExtractor._clean_text(match.group(2))
+            if not title:
+                continue
+            stop = re.search(
+                r"\b(Total|SPECIALISATION|AICTE|SEAT|NUMBER|Marks|Obtained|Grade|Points|Remark|Trimester)\b",
+                title,
+                flags=re.IGNORECASE,
+            )
+            if stop:
+                title = CertificateExtractor._clean_text(title[: stop.start()])
+            if not title or len(title) < 3:
+                continue
+            candidates.append((code, title))
+
+        deduped: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for code, title in candidates:
+            key = (code.upper(), title.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append({"course_code": code.upper(), "course_title": title})
+            if len(deduped) >= 10:
+                break
+        return deduped
 
     @staticmethod
     def _has_value(value: Any) -> bool:
@@ -696,8 +1405,8 @@ class CertificateExtractor:
         top_score = top_filled / len(TARGET_FIELDS)
 
         detail_slots = [
-            ("institute_details", ["name", "address", "approval", "document_type"]),
-            ("student_details", ["name", "examination", "held_in", "specialization", "seat_number", "aicte_number"]),
+            ("institute_details", ["name", "address", "document_type"]),
+            ("student_details", ["name", "examination", "held_in", "specialization", "seat_number", "aicte_number", "gender"]),
             ("result_summary", ["total_marks_obtained", "total_maximum_marks", "percentage", "gpa", "result"]),
             (
                 "final_summary",

@@ -44,6 +44,7 @@ FIELD_LABELS: dict[str, str] = {
     "total_grade_points": "Total Grade Points",
     "total_marks_obtained": "Total Marks Obtained",
     "result_declared_on": "Result Declared On",
+    "institute_address": "Institute Address",
 }
 
 FIELD_PATHS: dict[str, list[str]] = {
@@ -79,6 +80,7 @@ FIELD_PATHS: dict[str, list[str]] = {
     "total_grade_points": ["final_summary.total_grade_points"],
     "total_marks_obtained": ["final_summary.total_marks_obtained", "result_summary.total_marks_obtained"],
     "result_declared_on": ["result_declaration.result_declared_on", "issue_date"],
+    "institute_address": ["institute_details.address"],
 }
 
 

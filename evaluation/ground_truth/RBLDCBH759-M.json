@@ -1,0 +1,87 @@
+{
+  "student_name": "Shetty Saksham Harish Usha",
+  "course_name": "Post Graduate Diploma in Management",
+  "issue_date": "April, 2025",
+  "certificate_id": "PG23049",
+  "issuer": "SIES School of Business Studies",
+  "institute_details": {
+    "name": "SIES School of Business Studies",
+    "address": null,
+    "approval": null,
+    "document_type": "Marksheet / Result Statement"
+  },
+  "student_details": {
+    "name": "Shetty Saksham Harish Usha",
+    "examination": "Post Graduate Diploma in Management",
+    "held_in": "April 2025",
+    "specialization": "Marketing",
+    "seat_number": "PG23049",
+    "aicte_number": null
+  },
+  "course_details": [],
+  "result_summary": {
+    "total_marks_obtained": "73",
+    "total_maximum_marks": "100",
+    "percentage": "73.00%",
+    "gpa": "8.00",
+    "overall_grade": null,
+    "grade_range": null,
+    "result": "Pass"
+  },
+  "trimester_wise_performance": [
+    {
+      "trimester": "I",
+      "credits_earned": "21.0",
+      "marks": "457/700",
+      "percentage": "65.29%",
+      "gpa": "6.79"
+    },
+    {
+      "trimester": "II",
+      "credits_earned": "21.0",
+      "marks": "425/700",
+      "percentage": "60.71%",
+      "gpa": "5.86"
+    },
+    {
+      "trimester": "III",
+      "credits_earned": "21.0",
+      "marks": "472/700",
+      "percentage": "67.43%",
+      "gpa": "7.07"
+    },
+    {
+      "trimester": "IV",
+      "credits_earned": "24.0",
+      "marks": "539/800",
+      "percentage": "67.38%",
+      "gpa": "7.00"
+    },
+    {
+      "trimester": "V",
+      "credits_earned": "18.0",
+      "marks": "391/600",
+      "percentage": "65.17%",
+      "gpa": "6.83"
+    },
+    {
+      "trimester": "VI",
+      "credits_earned": "3.0",
+      "marks": "73/100",
+      "percentage": "73.00%",
+      "gpa": "8.00"
+    }
+  ],
+  "final_summary": {
+    "final_cgpa": "6.75",
+    "total_credits": "108.0",
+    "total_grade_points": "729.0",
+    "total_marks_obtained": "2357",
+    "total_maximum_marks": "3600"
+  },
+  "result_declaration": {
+    "result_declared_on": "13, June 2025",
+    "signed_by": "Head Examinations"
+  },
+  "confidence_score": 0.95
+}

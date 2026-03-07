@@ -48,6 +48,7 @@ LEARNABLE_FIELDS = [
     "total_grade_points",
     "total_marks_obtained",
     "result_declared_on",
+    "institute_address",
 ]
 
 STOPWORDS = {
@@ -501,10 +502,12 @@ class TemplateLearningEngine:
         for field in LEARNABLE_FIELDS:
             raw = annotations.get(field)
             if raw is None:
-                normalized[field] = None
+                mapped_field = "institute_details.address" if field == "institute_address" else field
+                normalized[mapped_field] = None
                 continue
             text = str(raw).strip()
-            normalized[field] = text or None
+            mapped_field = "institute_details.address" if field == "institute_address" else field
+            normalized[mapped_field] = text or None
         return normalized
 
     def _flatten_payload_for_training(self, payload: dict[str, Any]) -> dict[str, str | None]:
