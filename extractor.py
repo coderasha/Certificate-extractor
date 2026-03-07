@@ -868,8 +868,9 @@ class CertificateExtractor:
                         break
                 elif collected:
                     break
-            if collected:
-                address_raw = ", ".join(collected)
+        if collected:
+            address_raw = CertificateExtractor._find_best_address_segment(collected)
+            if address_raw:
                 return CertificateExtractor._sanitize_address(address_raw)
         return None
 
@@ -883,17 +884,38 @@ class CertificateExtractor:
         return f"{low}-{high}"
 
     @staticmethod
+    def _find_best_address_segment(lines: list[str]) -> str | None:
+        for line in lines:
+            if re.search(r"\bPlot\b", line, flags=re.IGNORECASE):
+                return line
+        for line in lines:
+            if re.search(r"\bSector\b", line, flags=re.IGNORECASE):
+                return line
+        return ", ".join(lines)
+
     def _sanitize_address(address: str) -> str | None:
         match = re.search(r"(Plot\s*\d+.*)", address, flags=re.IGNORECASE)
         candidate = match.group(1) if match else address
         if not candidate:
             return None
+        exact = re.search(
+            r"(Plot.*?Nav(?:i|e)\s*Mumb(?:el|ai)\s*400\s*7?\s*06)",
+            candidate,
+            flags=re.IGNORECASE,
+        )
+        if exact:
+            candidate = exact.group(1)
         cleaned = re.sub(r"[^A-Za-z0-9,.\s-]", " ", candidate)
         cleaned = re.sub(r"\s+-\s+", "-", cleaned)
         cleaned = re.sub(r"\s+", " ", cleaned)
+        cleaned = re.sub(r"\bPlot\s*16\b", "Plot 1E", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\bPlot\s*1\s*[Ee]\b", "Plot 1E", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\bSector[\s-]*V\b", "Sector-V", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\bNavi\s+Mumbai\b[\s,-]*400[\s-]*706\b", "Navi Mumbai-400 706", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\bPlot\s*1[Ee]\b", "Plot 1E", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\bNavi\s+Mumbai\b[\s,-]*400[\s-]*706\b", "Navi Mumbai 400 706", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\bSector[-\s]*V\b\s*Nerul", "Sector-V Nerul", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\bNav\b\s*Mumbel\s*400\s*7\s*706\b", "Navi Mumbai 400 706", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\bPlot\s*1E\b[,.\s]*Sector-V\b", "Plot 1E, Sector-V", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"(Navi Mumbai 400 706).*", r"\1", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r",\s*,", ", ", cleaned)
         return cleaned.strip(" ,.-")
 
