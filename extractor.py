@@ -288,13 +288,28 @@ class CertificateExtractor:
 
         current_trim = updated.get("trimester_wise_performance")
         text_trim = text_data.get("trimester_wise_performance") if isinstance(text_data, dict) else None
-        if CertificateExtractor._score_trimester_rows(text_trim) > CertificateExtractor._score_trimester_rows(current_trim):
-            updated["trimester_wise_performance"] = copy.deepcopy(text_trim)
+        updated["trimester_wise_performance"] = CertificateExtractor._merge_trimester_rows(
+            current_rows=current_trim,
+            text_rows=text_trim,
+            bbox_rows=bbox_trim,
+        )
 
         current_course = updated.get("course_details")
         text_course = text_data.get("course_details") if isinstance(text_data, dict) else None
-        if CertificateExtractor._score_course_details(text_course) > CertificateExtractor._score_course_details(current_course):
-            updated["course_details"] = copy.deepcopy(text_course)
+        bbox_course = bbox_data.get("course_details") if isinstance(bbox_data, dict) else None
+        updated["course_details"] = CertificateExtractor._merge_course_details(
+            current_rows=current_course,
+            text_rows=text_course,
+            bbox_rows=bbox_course,
+        )
+        CertificateExtractor._enrich_course_details_from_summary(updated)
+
+        student_block = updated.get("student_details")
+        if isinstance(student_block, dict):
+            cleaned_specialization = CertificateExtractor._sanitize_specialization_candidate(
+                student_block.get("specialization")
+            )
+            student_block["specialization"] = cleaned_specialization
 
         return updated
 
@@ -324,6 +339,20 @@ class CertificateExtractor:
 
         path = dotted_path.lower()
         score = 0
+
+        if path.endswith("student_details.specialization"):
+            cleaned = CertificateExtractor._sanitize_specialization_candidate(text)
+            if not cleaned:
+                return 5
+            score = 45
+            if re.search(r"\b(marketing|finance|hr|human resources|operations|analytics|it|international business)\b", cleaned, flags=re.IGNORECASE):
+                score += 35
+            if re.search(r"\d", text):
+                score -= 20
+            if re.search(r"\b(aicte|seat|roll|number|trimester|credits|marks)\b", text, flags=re.IGNORECASE):
+                score -= 25
+            score += min(12, len(re.findall(r"[A-Za-z]{3,}", cleaned)) * 4)
+            return score
 
         if "date" in path or "held_in" in path:
             if re.search(r"\b\d{1,2}\s*,?\s*[A-Za-z]+\s+\d{4}\b", text):
@@ -448,6 +477,87 @@ class CertificateExtractor:
         return score
 
     @staticmethod
+    def _merge_trimester_rows(current_rows: Any, text_rows: Any, bbox_rows: Any) -> list[dict[str, Any]]:
+        trimester_order = ["I", "II", "III", "IV", "V", "VI"]
+        metrics = ["credits_earned", "marks", "percentage", "gpa"]
+
+        def normalize_rows(rows: Any) -> list[dict[str, Any]]:
+            if not isinstance(rows, list):
+                return []
+            out: list[dict[str, Any]] = []
+            for row in rows:
+                if isinstance(row, dict):
+                    out.append(row)
+            return out
+
+        def map_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+            out: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                tri = CertificateExtractor._clean_text(row.get("trimester"))
+                if not tri:
+                    continue
+                normalized_tri = tri.upper()
+                if normalized_tri not in out:
+                    out[normalized_tri] = row
+            return out
+
+        current_list = normalize_rows(current_rows)
+        text_list = normalize_rows(text_rows)
+        bbox_list = normalize_rows(bbox_rows)
+        current_map = map_rows(current_list)
+        text_map = map_rows(text_list)
+        bbox_map = map_rows(bbox_list)
+
+        merged: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        ordered_trimesters = list(trimester_order)
+        for tri in [*current_map.keys(), *text_map.keys(), *bbox_map.keys()]:
+            if tri not in ordered_trimesters:
+                ordered_trimesters.append(tri)
+
+        for tri in ordered_trimesters:
+            current_row = current_map.get(tri, {})
+            text_row = text_map.get(tri, {})
+            bbox_row = bbox_map.get(tri, {})
+            if not current_row and not text_row and not bbox_row:
+                continue
+
+            row_out: dict[str, Any] = {"trimester": tri}
+            for key in metrics:
+                candidates = [
+                    current_row.get(key),
+                    text_row.get(key),
+                    bbox_row.get(key),
+                ]
+                if key == "gpa":
+                    candidates = [
+                        bbox_row.get(key),
+                        current_row.get(key),
+                        text_row.get(key),
+                    ]
+                best = None
+                for candidate in candidates:
+                    cleaned = CertificateExtractor._clean_text(candidate)
+                    if cleaned:
+                        best = cleaned
+                        break
+                row_out[key] = best
+
+            if any(CertificateExtractor._clean_text(row_out.get(key)) for key in metrics):
+                if tri not in seen:
+                    merged.append(row_out)
+                    seen.add(tri)
+
+        if merged:
+            return merged
+        if current_list:
+            return copy.deepcopy(current_list)
+        if text_list:
+            return copy.deepcopy(text_list)
+        return copy.deepcopy(bbox_list)
+
+    @staticmethod
     def _score_course_details(value: Any) -> int:
         if not isinstance(value, list) or not value:
             return -1000
@@ -471,6 +581,127 @@ class CertificateExtractor:
             if re.search(r"[^A-Za-z0-9\s&()'/-]", title):
                 score -= 6
         return score
+
+    @staticmethod
+    def _merge_course_details(current_rows: Any, text_rows: Any, bbox_rows: Any) -> list[dict[str, Any]]:
+        def normalize_rows(rows: Any) -> list[dict[str, Any]]:
+            if not isinstance(rows, list):
+                return []
+            out: list[dict[str, Any]] = []
+            for row in rows:
+                if isinstance(row, dict):
+                    out.append(row)
+            return out
+
+        merged: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for source_rows in [current_rows, text_rows, bbox_rows]:
+            for row in normalize_rows(source_rows):
+                code = CertificateExtractor._clean_text(row.get("course_code"))
+                title = CertificateExtractor._clean_text(row.get("course_title"))
+                if not code and not title:
+                    continue
+                normalized_code = code.upper() if code else None
+                key = ((normalized_code or "").upper(), (title or "").lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append({"course_code": normalized_code, "course_title": title})
+
+        return merged
+
+    @staticmethod
+    def _split_marks_ratio(value: Any) -> tuple[str | None, str | None]:
+        text = CertificateExtractor._clean_text(value)
+        if not text or "/" not in text:
+            return None, None
+        left, right = [part.strip() for part in text.split("/", 1)]
+        if not re.fullmatch(r"\d+(?:\.\d+)?", left):
+            left = None
+        if not re.fullmatch(r"\d+(?:\.\d+)?", right):
+            right = None
+        return left, right
+
+    @staticmethod
+    def _to_float(value: Any) -> float | None:
+        text = CertificateExtractor._clean_text(value)
+        if not text:
+            return None
+        normalized = text.replace("%", "").replace(",", ".")
+        try:
+            return float(normalized)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _format_numeric_like(value: float) -> str:
+        if float(value).is_integer():
+            return str(int(value))
+        return f"{value:.2f}".rstrip("0").rstrip(".")
+
+    @staticmethod
+    def _enrich_course_details_from_summary(payload: dict[str, Any]) -> None:
+        if not isinstance(payload, dict):
+            return
+        course_rows = payload.get("course_details")
+        if not isinstance(course_rows, list) or not course_rows:
+            return
+        if not isinstance(course_rows[0], dict):
+            return
+
+        summary = payload.get("result_summary")
+        summary = summary if isinstance(summary, dict) else {}
+        trimester_rows = payload.get("trimester_wise_performance")
+        trimester_rows = trimester_rows if isinstance(trimester_rows, list) else []
+
+        trimester_vi: dict[str, Any] = {}
+        for row in trimester_rows:
+            if not isinstance(row, dict):
+                continue
+            tri = CertificateExtractor._clean_text(row.get("trimester"))
+            if tri and tri.upper() == "VI":
+                trimester_vi = row
+                break
+        if not trimester_vi and trimester_rows and isinstance(trimester_rows[-1], dict):
+            trimester_vi = trimester_rows[-1]
+
+        row = course_rows[0]
+        marks_obtained = CertificateExtractor._clean_text(row.get("marks_obtained"))
+        maximum_marks = CertificateExtractor._clean_text(row.get("maximum_marks"))
+        if not marks_obtained or not maximum_marks:
+            tri_obtained, tri_maximum = CertificateExtractor._split_marks_ratio(trimester_vi.get("marks"))
+            marks_obtained = marks_obtained or CertificateExtractor._clean_text(summary.get("total_marks_obtained")) or tri_obtained
+            maximum_marks = maximum_marks or CertificateExtractor._clean_text(summary.get("total_maximum_marks")) or tri_maximum
+
+        course_credits = CertificateExtractor._clean_text(row.get("course_credits")) or CertificateExtractor._clean_text(
+            trimester_vi.get("credits_earned")
+        )
+        credits_earned = CertificateExtractor._clean_text(row.get("credits_earned")) or course_credits
+        grade_points = CertificateExtractor._clean_text(row.get("grade_points")) or CertificateExtractor._clean_text(
+            trimester_vi.get("gpa")
+        )
+        grade = CertificateExtractor._clean_text(row.get("grade")) or CertificateExtractor._clean_text(summary.get("overall_grade"))
+        remark = CertificateExtractor._clean_text(row.get("remark")) or CertificateExtractor._clean_text(summary.get("result"))
+        cxg = CertificateExtractor._clean_text(row.get("cxg"))
+
+        if not cxg:
+            credits_val = CertificateExtractor._to_float(course_credits)
+            grade_points_val = CertificateExtractor._to_float(grade_points)
+            if credits_val is not None and grade_points_val is not None:
+                cxg = CertificateExtractor._format_numeric_like(credits_val * grade_points_val)
+
+        row.update(
+            {
+                "marks_obtained": marks_obtained,
+                "maximum_marks": maximum_marks,
+                "course_credits": course_credits,
+                "credits_earned": credits_earned,
+                "grade_points": grade_points,
+                "grade": grade,
+                "remark": remark,
+                "cxg": cxg,
+            }
+        )
 
     def _extract_text_context(self, path: Path) -> str:
         suffix = path.suffix.lower()
@@ -1181,6 +1412,48 @@ class CertificateExtractor:
         return " ".join(token.capitalize() for token in tokens)
 
     @staticmethod
+    def _sanitize_specialization_candidate(value: Any) -> str | None:
+        text = CertificateExtractor._clean_text(value)
+        if not text:
+            return None
+
+        text = re.sub(r"^.*?\bSPECIALI\w*\b\s*[:\-]?\s*", "", text, flags=re.IGNORECASE)
+        text = re.split(
+            r"\b(AICTE|SEAT|ROLL|NUMBER|TRIMESTER|CREDITS|MARKS|GRADE|POINTS|REMARK|RESULT)\b",
+            text,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
+        text = re.sub(r"[^A-Za-z &/-]", " ", text)
+        text = re.sub(r"\s+", " ", text).strip(" -/:")
+        if not text:
+            return None
+
+        if re.search(r"\bmarketing\b", text, flags=re.IGNORECASE):
+            return "Marketing"
+
+        normalized = text.lower()
+        dictionary = {
+            "finance": "Finance",
+            "human resources": "Human Resources",
+            "hr": "Human Resources",
+            "operations": "Operations",
+            "analytics": "Analytics",
+            "information technology": "Information Technology",
+            "it": "Information Technology",
+            "international business": "International Business",
+            "entrepreneurship": "Entrepreneurship",
+        }
+        for token, label in dictionary.items():
+            if re.search(rf"\b{re.escape(token)}\b", normalized):
+                return label
+
+        words = [word for word in re.findall(r"[A-Za-z]+", text) if len(word) >= 2]
+        if not words:
+            return None
+        return " ".join(words[:3]).title()
+
+    @staticmethod
     def _score_name_candidate(value: str, has_slash: bool = False) -> int:
         tokens = value.split()
         score = 0
@@ -1390,6 +1663,14 @@ class CertificateExtractor:
             ],
             flags=re.IGNORECASE,
         )
+        if not specialization:
+            specialization = CertificateExtractor._extract_regex_value(
+                flat_text,
+                [
+                    r"\bSPECIALI\w*\b[^A-Za-z0-9]{0,12}([A-Za-z0-9 &]{2,80}?)(?=\bAICTE\b|\bSEAT\b|\bROLL\b|\bTRIMESTER\b|\bMARKS\b|$)",
+                ],
+                flags=re.IGNORECASE,
+            )
         course_name = CertificateExtractor._trim_at_keywords(
             course_name,
             ["HELD", "SPECIALIZATION", "SEAT", "AICTE", "SCHOOL", "CREDITS", "TRIMESTER"],
@@ -1402,12 +1683,7 @@ class CertificateExtractor:
             specialization,
             ["SEAT", "AICTE", "CREDITS", "TRIMESTER", "BUSINESS"],
         )
-        if specialization and re.search(r"\bmarketing\b", specialization, flags=re.IGNORECASE):
-            specialization = "Marketing"
-        elif specialization:
-            words = [w for w in re.findall(r"[A-Za-z]+", specialization) if len(w) > 1]
-            if words:
-                specialization = " ".join(words[:3]).title()
+        specialization = CertificateExtractor._sanitize_specialization_candidate(specialization)
         seat_number = CertificateExtractor._extract_regex_value(
             flat_text,
             [
@@ -1848,6 +2124,9 @@ class CertificateExtractor:
             normalized["student_details"]["examination"] = normalized["course_name"]
         if not normalized["student_details"].get("seat_number"):
             normalized["student_details"]["seat_number"] = normalized["certificate_id"]
+        normalized["student_details"]["specialization"] = CertificateExtractor._sanitize_specialization_candidate(
+            normalized["student_details"].get("specialization")
+        )
         if not normalized["result_declaration"].get("result_declared_on"):
             normalized["result_declaration"]["result_declared_on"] = normalized["issue_date"]
         if not normalized["institute_details"].get("name"):

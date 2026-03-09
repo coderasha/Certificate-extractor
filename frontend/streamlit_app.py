@@ -676,12 +676,34 @@ def _transform_sies_result(result: dict[str, Any]) -> dict[str, Any]:
     course_details_list = _safe_list(result.get("course_details"))
     first_course = _safe_dict(course_details_list[0] if course_details_list else {})
     trimester_rows = _safe_list(result.get("trimester_wise_performance"))
+    trimester_vi: dict[str, Any] = {}
+    for row in trimester_rows:
+        row_dict = _safe_dict(row)
+        if str(row_dict.get("trimester") or "").strip().upper() == "VI":
+            trimester_vi = row_dict
+            break
+    if not trimester_vi and trimester_rows:
+        trimester_vi = _safe_dict(trimester_rows[-1])
 
     marks_obtained = summary.get("total_marks_obtained")
     marks_maximum = summary.get("total_maximum_marks")
+    if (not marks_obtained or not marks_maximum) and trimester_vi.get("marks"):
+        marks_tokens = str(trimester_vi.get("marks")).split("/", 1)
+        if len(marks_tokens) == 2:
+            marks_obtained = marks_obtained or marks_tokens[0].strip()
+            marks_maximum = marks_maximum or marks_tokens[1].strip()
     marks_ratio = f"{marks_obtained}/{marks_maximum}" if marks_obtained and marks_maximum else None
     if not marks_ratio and first_course.get("marks_obtained") and first_course.get("maximum_marks"):
         marks_ratio = f"{first_course.get('marks_obtained')}/{first_course.get('maximum_marks')}"
+
+    course_credits = first_course.get("course_credits") or first_course.get("credits_earned") or trimester_vi.get("credits_earned")
+    grade_points = first_course.get("grade_points") or trimester_vi.get("gpa") or summary.get("gpa")
+    cxg_value = first_course.get("cxg")
+    if cxg_value is None:
+        credits_val = _to_float(course_credits)
+        grade_points_val = _to_float(grade_points)
+        if credits_val is not None and grade_points_val is not None:
+            cxg_value = round(credits_val * grade_points_val, 2)
 
     trimester_results: dict[str, Any] = {}
     for row in trimester_rows:
@@ -711,14 +733,14 @@ def _transform_sies_result(result: dict[str, Any]) -> dict[str, Any]:
         "course_details": {
             "course_code": first_course.get("course_code"),
             "course_title": first_course.get("course_title"),
-            "maximum_marks": _to_float(first_course.get("maximum_marks")),
+            "maximum_marks": _to_float(first_course.get("maximum_marks") or marks_maximum),
             "minimum_marks": _to_float(first_course.get("minimum_marks")),
             "marks_obtained": _to_float(first_course.get("marks_obtained") or marks_obtained),
-            "course_credits": _to_float(first_course.get("course_credits")),
+            "course_credits": _to_float(course_credits),
             "grade": first_course.get("grade") or summary.get("overall_grade"),
-            "credits_earned": _to_float(first_course.get("credits_earned")),
-            "grade_points": _to_float(first_course.get("grade_points")),
-            "cxg": _to_float(first_course.get("cxg")),
+            "credits_earned": _to_float(first_course.get("credits_earned") or course_credits),
+            "grade_points": _to_float(grade_points),
+            "cxg": _to_float(cxg_value),
         },
         "result_summary": {
             "remark": summary.get("result"),
