@@ -47,11 +47,13 @@ The app stores template learning data in `storage/template_learning/templates.js
 ## Extract (Inference Mode)
 1. Open the **Extract** tab.
 2. Upload a new certificate and run extraction.
-3. The pipeline now:
+3. Choose fields to extract and use **Add custom fields (comma separated)** for any new keys or dotted paths.
+4. Save reusable college-level field sets from **Sidebar -> College Library**.
+5. The pipeline now:
    - tries template matching/layout extraction first
    - merges template result with OCR + rule-based extraction
    - prefers learned template fields when template confidence is high
-4. If any field is wrong, use **Improve Accuracy With Corrections** under the result:
+6. If any field is wrong, use **Improve Accuracy With Corrections** under the result:
    - edit corrected values
    - optional: enable **Train with full labeled JSON (all relevant fields)** to train nested sections too
    - select/create a template

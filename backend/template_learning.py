@@ -91,11 +91,14 @@ class TemplateLearningEngine:
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.storage_dir / "templates.json"
 
-    def list_templates(self) -> list[dict[str, Any]]:
+    def list_templates(self, college_name: str | None = None) -> list[dict[str, Any]]:
         db = self._load_db()
         templates = db.get("templates", [])
         out: list[dict[str, Any]] = []
         for template in templates:
+            if college_name:
+                if str(template.get("college", "")).strip().lower() != college_name.strip().lower():
+                    continue
             out.append(
                 {
                     "template_id": template.get("template_id"),
@@ -113,6 +116,7 @@ class TemplateLearningEngine:
         annotations: dict[str, Any],
         template_name: str | None = None,
         template_id: str | None = None,
+        college_name: str | None = None,
         include_all_fields: bool = False,
         full_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -127,6 +131,7 @@ class TemplateLearningEngine:
             db=db,
             template_name=(template_name or "").strip() or None,
             template_id=template_id,
+            college_name=college_name,
             document_keywords=document["keywords"],
         )
 
@@ -173,13 +178,21 @@ class TemplateLearningEngine:
             "unresolved_fields": unresolved_fields,
         }
 
-    def extract(self, file_path: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    def extract(self, file_path: str, college_name: str | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
         db = self._load_db()
         templates = db.get("templates", [])
         if not templates:
             return {}, {"status": "no_templates"}
 
         document = self._build_document(file_path)
+        if college_name:
+            templates = [
+                tpl
+                for tpl in templates
+                if str(tpl.get("college", "")).strip().lower() == college_name.strip().lower()
+            ]
+        if not templates:
+            return {}, {"status": "no_templates_for_college", "college": college_name}
         best_template, score = self._match_template(document=document, templates=templates)
         if not best_template or score < 0.2:
             return {}, {"status": "no_template_match", "best_score": round(score, 3)}
@@ -220,6 +233,7 @@ class TemplateLearningEngine:
         db: dict[str, Any],
         template_name: str | None,
         template_id: str | None,
+        college_name: str | None,
         document_keywords: list[str],
     ) -> dict[str, Any]:
         templates = db.setdefault("templates", [])
@@ -232,11 +246,16 @@ class TemplateLearningEngine:
         if template_name:
             for template in templates:
                 if str(template.get("template_name", "")).strip().lower() == template_name.lower():
-                    return template
+                    if college_name:
+                        if str(template.get("college", "")).strip().lower() == college_name.lower():
+                            return template
+                    else:
+                        return template
 
         new_template = {
             "template_id": str(uuid4()),
             "template_name": template_name or f"Template {len(templates) + 1}",
+            "college": college_name or "",
             "created_at": self._now_iso(),
             "updated_at": self._now_iso(),
             "examples_count": 0,
@@ -499,14 +518,16 @@ class TemplateLearningEngine:
 
     def _normalize_annotations(self, annotations: dict[str, Any]) -> dict[str, str | None]:
         normalized: dict[str, str | None] = {}
-        for field in LEARNABLE_FIELDS:
-            raw = annotations.get(field)
+        for field, raw in annotations.items():
+            key = str(field or "").strip()
+            if not key:
+                continue
+            key = key.replace(" ", "_").lower()
+            mapped_field = "institute_details.address" if key == "institute_address" else key
             if raw is None:
-                mapped_field = "institute_details.address" if field == "institute_address" else field
                 normalized[mapped_field] = None
                 continue
             text = str(raw).strip()
-            mapped_field = "institute_details.address" if field == "institute_address" else field
             normalized[mapped_field] = text or None
         return normalized
 

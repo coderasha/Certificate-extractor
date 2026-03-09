@@ -8,6 +8,7 @@ from extractor import CertificateExtractor
 def run_pipeline(
     file_path: str,
     mode: str,
+    college_name: str,
     timeout_override: int | None = None,
     include_debug: bool = False,
 ) -> Any:
@@ -21,7 +22,7 @@ def run_pipeline(
     )
 
     template_engine = TemplateLearningEngine()
-    template_result, template_debug = template_engine.extract(file_path)
+    template_result, template_debug = template_engine.extract(file_path, college_name=college_name)
 
     if include_debug:
         ocr_result, ocr_debug = extractor.extract_with_debug(file_path)
