@@ -1,6 +1,6 @@
 # Intelligent Certificate Extractor
 
-Upload certificates (PDF/image), teach template-specific examples, and automatically extract fields from similar certificates.
+Upload certificates (ex-PDF/image), teach template-specific examples, and automatically extract fields from similar certificates.
 
 ## Output JSON Fields
 - `student_name`
