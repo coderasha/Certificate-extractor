@@ -61,7 +61,6 @@ The app stores template learning data in `storage/template_learning/templates.js
 
 This creates a continuous learning loop where corrected predictions immediately become new training data.
 
-Tip: Enable **Show OCR debug** in the sidebar to inspect OCR text context and extraction status.
 
 ## Run CLI
 `python main.py /path/to/certificate.pdf --pretty`
